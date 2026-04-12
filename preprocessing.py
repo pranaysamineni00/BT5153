@@ -126,6 +126,36 @@ def split_contract_records(
     )
 
 
+def sample_contracts(
+    contract_records: list[dict[str, Any]],
+    frac: float = 1.0,
+    seed: int = 42,
+) -> list[dict[str, Any]]:
+    """Return a reproducible random sample of ``frac`` of the given contract records.
+
+    Sampling is performed *before* the train/val/test split so every split
+    receives a proportional share of the reduced pool.  The methodology
+    (chunking, label assignment, split ratios) is identical to the full run —
+    only the number of contracts changes.
+
+    Args:
+        contract_records: Full list of contract records.
+        frac: Fraction of contracts to keep (0 < frac <= 1.0).
+        seed: Random seed for reproducibility.
+
+    Returns:
+        Shuffled-and-subsampled list of contract records.
+    """
+    if frac >= 1.0:
+        return contract_records
+    n = max(1, round(len(contract_records) * frac))
+    rng = np.random.default_rng(seed)
+    indices = rng.choice(len(contract_records), size=n, replace=False)
+    sampled = [contract_records[i] for i in sorted(indices)]
+    print(f"sample_contracts: using {n}/{len(contract_records)} contracts ({frac:.0%})")
+    return sampled
+
+
 # ── Chunk examples ────────────────────────────────────────────────────────────
 
 def _span_overlaps_chunk(span_start: int, span_end: int, chunk_start: int, chunk_end: int) -> bool:
@@ -269,15 +299,24 @@ def prepare_chunked_splits(
     max_length: int = 512,
     stride: int = 128,
     seed: int = 42,
+    sample_frac: float = 1.0,
 ) -> dict[str, Any]:
     """End-to-end helper: build clause mappings, split contracts, tokenize, return all artifacts.
 
     Note: call filter_clauses(cuad_df) before passing in if you want to exclude
     low-frequency clause types. This function uses whatever clause types are present in cuad_df.
+
+    Args:
+        sample_frac: Fraction of contracts to use (0 < frac <= 1.0).  Values
+            below 1.0 invoke ``sample_contracts`` before splitting, giving a
+            representative subset that runs proportionally faster.  Set to 1.0
+            (default) for the full dataset.
     """
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     clause_to_id, id_to_clause = build_clause_mappings(cuad_df)
     contract_records = build_contract_records(cuad_df)
+    if sample_frac < 1.0:
+        contract_records = sample_contracts(contract_records, frac=sample_frac, seed=seed)
     train_records, val_records, test_records = split_contract_records(contract_records, seed=seed)
     train_ex = build_chunk_examples(train_records, clause_to_id, tokenizer, max_length, stride)
     val_ex   = build_chunk_examples(val_records,   clause_to_id, tokenizer, max_length, stride)

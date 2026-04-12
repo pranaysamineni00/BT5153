@@ -117,6 +117,10 @@ def _run_training_loop(
     if epochs < 1:
         raise ValueError(f"epochs must be >= 1, got {epochs}")
 
+    # Mixed precision: ~1.5-2x speedup on CUDA (T4/V100/A100). No-op on CPU/MPS.
+    use_amp = device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
     best_state: dict | None = None
     best_t = 0.5
     best_metrics: dict[str, float] = {"micro_f1": -1.0}
@@ -135,15 +139,17 @@ def _run_training_loop(
             labels = batch["labels"].to(device)
             inputs = {k: v.to(device) for k, v in batch.items() if k != "labels"}
             optimizer.zero_grad(set_to_none=True)
-            logits = model(**inputs).logits
 
-            # per-sample loss weighting: down-weight all-negative chunks
-            batch_size_actual = labels.shape[0]
-            batch_sw = sample_weights[sample_offset:sample_offset + batch_size_actual].to(device)
-            loss = (loss_fn(logits, labels).mean(dim=1) * batch_sw).mean()
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                logits = model(**inputs).logits
+                # per-sample loss weighting: down-weight all-negative chunks
+                batch_size_actual = labels.shape[0]
+                batch_sw = sample_weights[sample_offset:sample_offset + batch_size_actual].to(device)
+                loss = (loss_fn(logits, labels).mean(dim=1) * batch_sw).mean()
 
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             total_loss += float(loss.item())
             seen += 1
@@ -297,8 +303,11 @@ def train_bert_cuad(
         ignore_mismatched_sizes=True,
     ).to(device)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
+    _pin = device.type == "cuda"
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
+                              num_workers=2, pin_memory=_pin, persistent_workers=True)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
         model, train_loader, val_loader, train_examples, device,
@@ -377,11 +386,15 @@ def train_bert_ledgar_cuad(
                 "labels":         item["label"],
             }
 
+    _pin = device.type == "cuda"
     ledgar_loader = TorchDataLoader(
-        _LedgarDataset(ledgar_tok), batch_size=batch_size, shuffle=True
+        _LedgarDataset(ledgar_tok), batch_size=batch_size, shuffle=True,
+        num_workers=2, pin_memory=_pin, persistent_workers=True,
     )
     optimizer_p1 = torch.optim.AdamW(ledgar_model.parameters(), lr=learning_rate, weight_decay=0.01)
     ce_loss = torch.nn.CrossEntropyLoss()
+    use_amp = device.type == "cuda"
+    scaler_p1 = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     for epoch in range(1, ledgar_epochs + 1):
         ledgar_model.train()
@@ -392,10 +405,12 @@ def train_bert_ledgar_cuad(
             labels = batch["labels"].to(device)
             inputs = {k: v.to(device) for k, v in batch.items() if k != "labels"}
             optimizer_p1.zero_grad(set_to_none=True)
-            logits = ledgar_model(**inputs).logits
-            loss = ce_loss(logits, labels)
-            loss.backward()
-            optimizer_p1.step()
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                logits = ledgar_model(**inputs).logits
+                loss = ce_loss(logits, labels)
+            scaler_p1.scale(loss).backward()
+            scaler_p1.step(optimizer_p1)
+            scaler_p1.update()
             total_loss += float(loss.item())
             seen += 1
         print(f"  LEDGAR epoch {epoch}: loss={total_loss / max(1, seen):.4f}")
@@ -426,8 +441,10 @@ def train_bert_ledgar_cuad(
           f"missing={len(missing)}, unexpected={len(unexpected)}")
     cuad_model = cuad_model.to(device)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
+                              num_workers=2, pin_memory=_pin, persistent_workers=True)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
         cuad_model, train_loader, val_loader, train_examples, device,
@@ -570,8 +587,17 @@ def train_longformer_cuad(
         ignore_mismatched_sizes=True,
     ).to(device)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
+    # Gradient checkpointing: recomputes activations on the backward pass instead
+    # of storing them, trading ~15% extra compute for ~4x less activation memory.
+    # Critical for Longformer at 4096 tokens — without this the T4/A100 runs OOM.
+    model.config.use_cache = False
+    model.gradient_checkpointing_enable()
+
+    _pin = device.type == "cuda"
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
+                              num_workers=2, pin_memory=_pin, persistent_workers=True)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
         model, train_loader, val_loader, train_examples, device,
@@ -614,8 +640,16 @@ def train_legalbert_longformer_cuad(
         longformer_name=longformer_name,
     ).to(device)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
+    # Gradient checkpointing: same rationale as train_longformer_cuad — prevents
+    # OOM on 4096-token sequences without changing the training methodology.
+    model.config.use_cache = False
+    model.gradient_checkpointing_enable()
+
+    _pin = device.type == "cuda"
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
+                              num_workers=2, pin_memory=_pin, persistent_workers=True)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
         model, train_loader, val_loader, train_examples, device,
