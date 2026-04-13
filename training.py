@@ -13,6 +13,32 @@ from transformers import AutoModelForSequenceClassification, get_linear_schedule
 from preprocessing import MultiLabelChunkDataset, compute_pos_weight, compute_sample_weights
 
 
+def _tfidf_proba_col(est, X):
+    """Return class-1 probability; DummyClassifier may only have one class."""
+    proba = est.predict_proba(X)
+    if len(est.classes_) == 1:
+        return np.full(X.shape[0], float(est.classes_[0]))
+    return proba[:, 1]
+
+
+class _TfIdfPipeline:
+    """Wraps a TF-IDF vectorizer + per-label estimators for inference.
+
+    predict_proba returns raw probabilities in [0, 1] — NOT log-odds.
+    Convert to log-odds before passing to sigmoid-based evaluation if needed:
+        p = np.clip(pipeline.predict_proba(texts), 1e-7, 1-1e-7)
+        logits = np.log(p / (1 - p))
+    """
+
+    def __init__(self, vec, ests):
+        self.vectorizer = vec
+        self.estimators_ = ests
+
+    def predict_proba(self, texts: list[str]) -> np.ndarray:
+        X = self.vectorizer.transform(texts)
+        return np.column_stack([_tfidf_proba_col(e, X) for e in self.estimators_])
+
+
 @dataclass
 class ModelArtifacts:
     """Unified container returned by every training function."""
@@ -221,37 +247,13 @@ def train_tfidf_lr(
         est.fit(X_train, col)
         estimators.append(est)
 
-    def _proba_col(est, X):
-        """Return class-1 probability; DummyClassifier may only have one class."""
-        proba = est.predict_proba(X)
-        if len(est.classes_) == 1:
-            # Only one class seen — return constant 1.0 if that class is 1, else 0.0
-            return np.full(X.shape[0], float(est.classes_[0]))
-        return proba[:, 1]
-
     # Collect class-1 probabilities; convert to log-odds for uniform interface with _sigmoid
     eps = 1e-7
-    val_probs = np.column_stack([_proba_col(est, X_val) for est in estimators])
+    val_probs = np.column_stack([_tfidf_proba_col(est, X_val) for est in estimators])
     p = np.clip(val_probs, eps, 1 - eps)
     val_logits = np.log(p / (1 - p))
 
     best_t, val_metrics = _tune_global_threshold(val_logits, val_labels)
-
-    class _TfIdfPipeline:
-        """Wraps vectorizer + per-label estimators for inference.
-
-        predict_proba returns raw probabilities in [0, 1] — NOT log-odds.
-        Convert to log-odds before passing to sigmoid-based evaluation if needed:
-            p = np.clip(pipeline.predict_proba(texts), 1e-7, 1-1e-7)
-            logits = np.log(p / (1 - p))
-        """
-        def __init__(self, vec, ests):
-            self.vectorizer = vec
-            self.estimators_ = ests
-
-        def predict_proba(self, texts: list[str]) -> np.ndarray:
-            X = self.vectorizer.transform(texts)
-            return np.column_stack([_proba_col(e, X) for e in self.estimators_])
 
     pipeline = _TfIdfPipeline(vectorizer, estimators)
 
