@@ -119,6 +119,7 @@ def compute_per_clause_metrics(
             "f1":                     float(f1_score(y_true, preds, zero_division=0)),
             "precision_at_80_recall": precision_at_recall_threshold(y_true, y_score, 0.80),
             "aupr":                   float(average_precision_score(y_true, y_score)) if y_true.sum() > 0 else 0.0,
+            "support_test":           int(y_true.sum()),
             "n_positive_train":       n_positive_train.get(clause_id, 0),
         })
     return pd.DataFrame(rows).sort_values("f1", ascending=False).reset_index(drop=True)
