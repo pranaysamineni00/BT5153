@@ -1,0 +1,30 @@
+# Core ML & data
+numpy
+pandas
+scikit-learn
+scipy
+
+# PyTorch & transformers
+torch>=2.0
+torchvision
+transformers>=4.36
+
+# Visualization
+matplotlib
+seaborn
+
+# Data loading
+datasets
+huggingface_hub
+
+# API & external services
+groq>=0.4
+openai>=1.30
+
+# Utils
+tqdm
+joblib
+
+# Notebook
+jupyter
+ipython
