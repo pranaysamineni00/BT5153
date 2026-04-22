@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForSequenceClassification, get_linear_schedule_with_warmup
 
-from preprocessing import MultiLabelChunkDataset, compute_pos_weight, compute_sample_weights
+from preprocessing import MultiLabelChunkDataset, compute_pos_weight
 
 
 def _tfidf_proba_col(est, X):
@@ -66,6 +66,41 @@ def _sigmoid(logits: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(logits, -500, 500)))
 
 
+def _aggregate_to_contract_level(
+    chunk_logits: np.ndarray,
+    chunk_labels: np.ndarray,
+    examples: list[dict],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Max-probability rollup: chunk predictions → one row per contract.
+
+    examples must be aligned with chunk_logits/chunk_labels (same order, val loader
+    must use shuffle=False). For each (contract, clause) pair the maximum sigmoid
+    probability across all chunks is taken; labels are OR-ed (max) across chunks.
+    Returns contract-level logits as log-odds so they are compatible with _sigmoid.
+    """
+    seen: dict[str, int] = {}
+    contract_order: list[str] = []
+    for ex in examples:
+        t = ex["contract_title"]
+        if t not in seen:
+            seen[t] = len(contract_order)
+            contract_order.append(t)
+
+    n_contracts = len(contract_order)
+    n_labels = chunk_logits.shape[1]
+    contract_max_probs = np.zeros((n_contracts, n_labels), dtype=np.float32)
+    contract_labels = np.zeros((n_contracts, n_labels), dtype=np.float32)
+
+    chunk_probs = _sigmoid(chunk_logits)
+    for i, ex in enumerate(examples):
+        ci = seen[ex["contract_title"]]
+        contract_max_probs[ci] = np.maximum(contract_max_probs[ci], chunk_probs[i])
+        contract_labels[ci] = np.maximum(contract_labels[ci], chunk_labels[i])
+
+    p = np.clip(contract_max_probs, 1e-7, 1 - 1e-7)
+    return np.log(p / (1 - p)), contract_labels
+
+
 def _tune_global_threshold(
     logits: np.ndarray,
     labels: np.ndarray,
@@ -117,6 +152,7 @@ def _run_training_loop(
     train_loader: DataLoader,
     val_loader: DataLoader,
     train_examples: list[dict],
+    val_examples: list[dict],
     device: torch.device,
     epochs: int = 3,
     learning_rate: float = 2e-5,
@@ -128,6 +164,8 @@ def _run_training_loop(
     """Shared training loop for all transformer models.
 
     Returns (model, history_df, best_threshold, best_val_metrics, best_val_logits, best_val_labels).
+    val_logits and val_labels in the return value are contract-level (max-probability rollup),
+    matching the granularity used in Section 4 test evaluation.
     Applies pos_weight (BCEWithLogitsLoss) and per-sample downweighting for all-negative chunks.
     """
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -136,7 +174,6 @@ def _run_training_loop(
     scheduler = get_linear_schedule_with_warmup(optimizer, int(total_steps * warmup_ratio), total_steps)
 
     pos_weight = compute_pos_weight(train_examples).to(device)
-    sample_weights = torch.tensor(compute_sample_weights(train_examples), dtype=torch.float32)
     # reduction="none" so we can apply per-sample weights manually
     loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
 
@@ -157,7 +194,6 @@ def _run_training_loop(
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss, seen = 0.0, 0
-        sample_offset = 0  # tracks position in sample_weights across batches
 
         for bi, batch in enumerate(train_loader):
             if max_train_batches is not None and bi >= max_train_batches:
@@ -168,9 +204,12 @@ def _run_training_loop(
 
             with torch.cuda.amp.autocast(enabled=use_amp):
                 logits = model(**inputs).logits
-                # per-sample loss weighting: down-weight all-negative chunks
-                batch_size_actual = labels.shape[0]
-                batch_sw = sample_weights[sample_offset:sample_offset + batch_size_actual].to(device)
+                # Per-sample down-weighting: all-negative chunks get weight 0.1.
+                # Computed directly from the batch labels so it is correct under shuffle.
+                is_all_negative = (labels == 0).all(dim=1)
+                batch_sw = torch.where(is_all_negative,
+                                       torch.full((labels.shape[0],), 0.1, device=device),
+                                       torch.ones(labels.shape[0], device=device))
                 loss = (loss_fn(logits, labels).mean(dim=1) * batch_sw).mean()
 
             scaler.scale(loss).backward()
@@ -179,13 +218,20 @@ def _run_training_loop(
             scheduler.step()
             total_loss += float(loss.item())
             seen += 1
-            sample_offset += batch_size_actual
 
-        val_logits, val_labels = collect_logits_and_labels(model, val_loader, device, max_val_batches)
+        val_chunk_logits, val_chunk_labels = collect_logits_and_labels(model, val_loader, device, max_val_batches)
+        # Roll up to contract level so thresholds are tuned on the same granularity
+        # as Section 4 test evaluation (max-probability rollup per contract).
+        # Slice val_examples to match the collected rows when max_val_batches truncates.
+        val_ex_subset = val_examples[:len(val_chunk_logits)]
+        val_logits, val_labels = _aggregate_to_contract_level(val_chunk_logits, val_chunk_labels, val_ex_subset)
         t, metrics = _tune_global_threshold(val_logits, val_labels)
         history_rows.append({"epoch": epoch, "train_loss": total_loss / max(1, seen),
                               "val_threshold": t, **metrics})
 
+        # Checkpoint selected by micro-F1 (frequency-weighted). Macro-F1 (equal per-clause
+        # weight) may peak at a different epoch, but micro-F1 is used here to avoid
+        # overfitting on the rare tail during validation-based early stopping.
         if metrics["micro_f1"] > best_metrics["micro_f1"]:
             best_metrics = metrics
             best_t = t
@@ -278,6 +324,7 @@ def train_bert_cuad(
     model_name: str,
     tokenizer: Any,
     id_to_clause: dict[int, str],
+    val_examples: list[dict] | None = None,
     epochs: int = 3,
     batch_size: int = 8,
     learning_rate: float = 2e-5,
@@ -312,7 +359,7 @@ def train_bert_cuad(
                               num_workers=2, pin_memory=_pin, persistent_workers=True)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
-        model, train_loader, val_loader, train_examples, device,
+        model, train_loader, val_loader, train_examples, val_examples or [], device,
         epochs, learning_rate, weight_decay, warmup_ratio,
         max_train_batches, max_val_batches,
     )
@@ -339,6 +386,7 @@ def train_bert_ledgar_cuad(
     model_name: str,
     tokenizer: Any,
     id_to_clause: dict[int, str],
+    val_examples: list[dict] | None = None,
     ledgar_epochs: int = 3,
     ledgar_max_batches: int | None = None,
     cuad_epochs: int = 3,
@@ -449,7 +497,7 @@ def train_bert_ledgar_cuad(
                               num_workers=2, pin_memory=_pin, persistent_workers=True)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
-        cuad_model, train_loader, val_loader, train_examples, device,
+        cuad_model, train_loader, val_loader, train_examples, val_examples or [], device,
         epochs=cuad_epochs,
         learning_rate=learning_rate,
         weight_decay=0.01,
@@ -478,6 +526,7 @@ def train_legal_bert_cuad(
     train_examples: list[dict],
     tokenizer: Any,
     id_to_clause: dict[int, str],
+    val_examples: list[dict] | None = None,
     model_name: str = "nlpaueb/legal-bert-base-uncased",
     epochs: int = 3,
     batch_size: int = 8,
@@ -490,6 +539,7 @@ def train_legal_bert_cuad(
     return train_bert_cuad(
         train_dataset, val_dataset, train_examples,
         model_name, tokenizer, id_to_clause,
+        val_examples=val_examples,
         epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
         max_train_batches=max_train_batches, max_val_batches=max_val_batches,
         device=device, artifact_name="Legal-BERT (CUAD)",
@@ -569,6 +619,7 @@ def train_longformer_cuad(
     train_examples: list[dict],
     tokenizer: Any,
     id_to_clause: dict[int, str],
+    val_examples: list[dict] | None = None,
     model_name: str = "allenai/longformer-base-4096",
     epochs: int = 3,
     batch_size: int = 4,
@@ -602,7 +653,7 @@ def train_longformer_cuad(
                               num_workers=2, pin_memory=_pin, persistent_workers=True)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
-        model, train_loader, val_loader, train_examples, device,
+        model, train_loader, val_loader, train_examples, val_examples or [], device,
         epochs=epochs,
         learning_rate=learning_rate,
         weight_decay=0.01,
@@ -625,6 +676,7 @@ def train_legalbert_longformer_cuad(
     train_examples: list[dict],
     tokenizer: Any,
     id_to_clause: dict[int, str],
+    val_examples: list[dict] | None = None,
     legal_bert_name: str = "nlpaueb/legal-bert-base-uncased",
     longformer_name: str = "allenai/longformer-base-4096",
     epochs: int = 3,
@@ -654,7 +706,7 @@ def train_legalbert_longformer_cuad(
                               num_workers=2, pin_memory=_pin, persistent_workers=True)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
-        model, train_loader, val_loader, train_examples, device,
+        model, train_loader, val_loader, train_examples, val_examples or [], device,
         epochs=epochs,
         learning_rate=learning_rate,
         weight_decay=0.01,

@@ -264,6 +264,7 @@ def compute_pos_weight(chunk_examples: list[dict[str, Any]]) -> torch.Tensor:
     positive_counts = label_matrix.sum(axis=0)
     negative_counts = len(label_matrix) - positive_counts
     weights = np.where(positive_counts > 0, negative_counts / np.maximum(positive_counts, 1.0), 1.0)
+    weights = np.clip(weights, 0, 10.0)
     return torch.tensor(weights, dtype=torch.float32)
 
 
