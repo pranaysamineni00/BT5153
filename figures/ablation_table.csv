@@ -1,0 +1,8 @@
+Variant,Micro-F1,Macro-F1,Micro-Precision,Micro-Recall,Runtime (s),Δ Micro-F1
+V1 — Baseline,0.7936,0.6318,0.8095,0.7784,5.8,0.0
+V2 — word+char n-grams,0.7997,0.6125,0.8084,0.7912,33.1,0.0061
+V3 — + per-clause C,0.7833,0.583,0.8082,0.7599,109.9,-0.0103
+V4 — + calibration,0.7905,0.5847,0.7775,0.804,121.6,-0.0031
+V5 — + per-clause thresholds,0.802,0.6921,0.7285,0.892,122.0,0.0084
+V6 — + MiniLM ensemble,0.7875,0.6911,0.7131,0.8793,123.7,-0.0061
+V7 — Hybrid features (scaled),0.7915,0.6426,0.7431,0.8466,356.5,-0.0021

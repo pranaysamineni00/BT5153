@@ -21,6 +21,9 @@ huggingface_hub
 groq>=0.4
 openai>=1.30
 
+# Sentence embeddings (CPU-friendly, for performance tuning)
+sentence-transformers>=2.5
+
 # Utils
 tqdm
 joblib

@@ -307,9 +307,9 @@ def train_bert_cuad(
 
     _pin = device.type == "cuda"
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+                              num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+                              num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
         model, train_loader, val_loader, train_examples, device,
@@ -354,8 +354,6 @@ def train_bert_ledgar_cuad(
     Phase 2 strips the LEDGAR classification head, attaches a new multi-label head,
     and fine-tunes on CUAD using the shared _run_training_loop.
     """
-    from torch.utils.data import Dataset as TorchDataset, DataLoader as TorchDataLoader
-
     device = device or choose_device()
 
     # ── Phase 1: LEDGAR fine-tuning ───────────────────────────────────────────
@@ -375,23 +373,11 @@ def train_bert_ledgar_cuad(
     ledgar_tok = ledgar_train.map(_tokenize_ledgar, batched=True)
     ledgar_tok.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
 
-    class _LedgarDataset(TorchDataset):
-        def __init__(self, hf_ds):
-            self.ds = hf_ds
-        def __len__(self):
-            return len(self.ds)
-        def __getitem__(self, i):
-            item = self.ds[i]
-            return {
-                "input_ids":      item["input_ids"],
-                "attention_mask": item["attention_mask"],
-                "labels":         item["label"],
-            }
-
+    from torch.utils.data import DataLoader as TorchDataLoader
     _pin = device.type == "cuda"
     ledgar_loader = TorchDataLoader(
         _LedgarDataset(ledgar_tok), batch_size=batch_size, shuffle=True,
-        num_workers=2, pin_memory=_pin, persistent_workers=True,
+        num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin,
     )
     optimizer_p1 = torch.optim.AdamW(ledgar_model.parameters(), lr=learning_rate, weight_decay=0.01)
     ce_loss = torch.nn.CrossEntropyLoss()
@@ -444,9 +430,9 @@ def train_bert_ledgar_cuad(
     cuad_model = cuad_model.to(device)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+                              num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+                              num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
         cuad_model, train_loader, val_loader, train_examples, device,
@@ -597,9 +583,9 @@ def train_longformer_cuad(
 
     _pin = device.type == "cuda"
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+                              num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+                              num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
         model, train_loader, val_loader, train_examples, device,
@@ -649,9 +635,9 @@ def train_legalbert_longformer_cuad(
 
     _pin = device.type == "cuda"
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+                              num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin)
     val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+                              num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
         model, train_loader, val_loader, train_examples, device,
@@ -668,4 +654,545 @@ def train_legalbert_longformer_cuad(
         model=model, tokenizer=tokenizer,
         best_threshold=best_t, val_metrics=metrics, history=history,
         id_to_clause=id_to_clause, val_logits=val_logits, val_labels=val_labels,
+    )
+
+
+class _LedgarDataset(torch.utils.data.Dataset):
+    def __init__(self, hf_ds):
+        self.ds = hf_ds
+    def __len__(self):
+        return len(self.ds)
+    def __getitem__(self, i):
+        item = self.ds[i]
+        return {
+            "input_ids":      item["input_ids"],
+            "attention_mask": item["attention_mask"],
+            "labels":         item["label"],
+        }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Performance-tuning variants — CPU-friendly upgrades over train_tfidf_lr
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def _build_contract_matrix(df: pd.DataFrame, id_to_clause: dict[int, str]) -> tuple[list[str], np.ndarray]:
+    """Shared helper: one row per contract, full text + multi-label vector."""
+    name_to_id = {v: k for k, v in id_to_clause.items()}
+    texts, label_rows = [], []
+    for _, group in df.groupby("contract_title"):
+        texts.append(group["contract_text"].iloc[0])
+        row = np.zeros(len(id_to_clause), dtype=float)
+        for r in group.itertuples(index=False):
+            if r.has_answer and r.clause_type in name_to_id:
+                row[name_to_id[r.clause_type]] = 1.0
+        label_rows.append(row)
+    return texts, np.array(label_rows)
+
+
+class _HybridPipeline:
+    """Like _TfIdfPipeline but supports a FeatureUnion (word + char TF-IDF)."""
+
+    def __init__(self, vectorizer, estimators):
+        self.vectorizer = vectorizer
+        self.estimators_ = estimators
+
+    def predict_proba(self, texts: list[str]) -> np.ndarray:
+        X = self.vectorizer.transform(texts)
+        return np.column_stack([_tfidf_proba_col(e, X) for e in self.estimators_])
+
+
+def train_tfidf_lr_v2(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    id_to_clause: dict[int, str],
+    ngram_word: tuple[int, int] = (1, 3),
+    ngram_char: tuple[int, int] = (3, 5),
+    max_features_word: int = 100_000,
+    max_features_char: int = 50_000,
+    tune_C: bool = False,
+    calibrate: bool = False,
+    artifact_name: str = "TF-IDF + LR (v2)",
+    verbose: bool = True,
+) -> ModelArtifacts:
+    """Enhanced TF-IDF + LR: word+char n-grams, per-clause C tuning, optional calibration."""
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.dummy import DummyClassifier
+    from sklearn.pipeline import FeatureUnion
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.model_selection import GridSearchCV
+
+    train_texts, train_labels = _build_contract_matrix(train_df, id_to_clause)
+    val_texts,   val_labels   = _build_contract_matrix(val_df,   id_to_clause)
+
+    # Combined word + character n-gram features via FeatureUnion
+    vectorizer = FeatureUnion([
+        ("word", TfidfVectorizer(
+            analyzer="word", ngram_range=ngram_word,
+            max_features=max_features_word, sublinear_tf=True,
+        )),
+        ("char", TfidfVectorizer(
+            analyzer="char_wb", ngram_range=ngram_char,
+            max_features=max_features_char, sublinear_tf=True,
+        )),
+    ])
+    X_train = vectorizer.fit_transform(train_texts)
+    X_val   = vectorizer.transform(val_texts)
+
+    if verbose:
+        print(f"Features: {X_train.shape[1]:,} (word+char)")
+
+    C_grid = [0.1, 1.0, 10.0]
+
+    estimators = []
+    chosen_Cs: list[float | None] = []
+    for i in range(train_labels.shape[1]):
+        col = train_labels[:, i]
+        if len(np.unique(col)) < 2:
+            est = DummyClassifier(strategy="most_frequent")
+            est.fit(X_train, col)
+            estimators.append(est)
+            chosen_Cs.append(None)
+            continue
+
+        # Stratified CV needs ≥ cv samples for BOTH classes (positive AND negative).
+        # Common clauses (e.g. "Parties") appear in nearly every contract → n_neg is tiny.
+        n_pos = int(col.sum())
+        n_neg = int(len(col) - n_pos)
+        min_class = min(n_pos, n_neg)
+        cv_safe = min(3, min_class)   # 3 if both classes have ≥3, else 2, else 0
+
+        # Only per-clause tune when CV is reliable: require ≥10 of the minority class
+        # so each of 3 folds has ≥3 samples. Otherwise fall back to C=1.0 (tuned C grid
+        # on tiny positive counts is pure noise — that was the V3 regression).
+        if tune_C and min_class >= 10:
+            base = LogisticRegression(class_weight="balanced", max_iter=1000, solver="lbfgs")
+            gs = GridSearchCV(base, {"C": C_grid}, cv=cv_safe, scoring="f1", n_jobs=1)
+            gs.fit(X_train, col)
+            best_C = float(gs.best_params_["C"])
+        else:
+            best_C = 1.0
+
+        est = LogisticRegression(
+            class_weight="balanced", max_iter=1000, C=best_C, solver="lbfgs",
+        )
+
+        if calibrate and cv_safe >= 2:
+            est = CalibratedClassifierCV(est, cv=cv_safe, method="sigmoid")
+
+        est.fit(X_train, col)
+        estimators.append(est)
+        chosen_Cs.append(best_C)
+
+    # Collect class-1 probabilities; convert to log-odds for sigmoid-based evaluation
+    eps = 1e-7
+    val_probs = np.column_stack([_tfidf_proba_col(est, X_val) for est in estimators])
+    p = np.clip(val_probs, eps, 1 - eps)
+    val_logits = np.log(p / (1 - p))
+
+    best_t, val_metrics = _tune_global_threshold(val_logits, val_labels)
+
+    pipeline = _HybridPipeline(vectorizer, estimators)
+
+    if verbose:
+        chosen_summary = pd.Series([c for c in chosen_Cs if c is not None]).value_counts().to_dict() if tune_C else {1.0: sum(1 for c in chosen_Cs if c is not None)}
+        print(f"{artifact_name} → val micro_F1={val_metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+        if tune_C:
+            print(f"  per-clause C distribution: {chosen_summary}")
+
+    return ModelArtifacts(
+        model_name=artifact_name,
+        model=pipeline,
+        tokenizer=None,
+        best_threshold=best_t,
+        val_metrics=val_metrics,
+        history=pd.DataFrame(),
+        id_to_clause=id_to_clause,
+        val_logits=val_logits,
+        val_labels=val_labels,
+    )
+
+
+# ─── MiniLM embedding backbone ──────────────────────────────────────────────
+
+
+class _EmbeddingPipeline:
+    """Wraps a sentence-transformer encoder + per-label LR estimators.
+
+    predict_proba(texts) returns class-1 probabilities (n_texts, n_labels).
+    Embedding generation: split on "\\n\\n", encode each passage, mean-pool per contract.
+    """
+
+    def __init__(self, encoder_name: str, estimators: list, embeddings: np.ndarray | None = None):
+        self.encoder_name = encoder_name
+        self.estimators_ = estimators
+        # Encoder is loaded lazily (avoids pickling torch modules into checkpoints)
+        self._encoder = None
+        self._train_embeddings = embeddings
+
+    def _get_encoder(self):
+        if self._encoder is None:
+            from sentence_transformers import SentenceTransformer
+            self._encoder = SentenceTransformer(self.encoder_name)
+        return self._encoder
+
+    def encode_contracts(self, texts: list[str], batch_size: int = 64) -> np.ndarray:
+        encoder = self._get_encoder()
+        vectors = []
+        for text in texts:
+            passages = [p.strip() for p in text.split("\n\n") if p.strip()]
+            if not passages:
+                passages = [text[:2000]]
+            # Clip each passage to stay within MiniLM's 256-token window
+            passages = [p[:1500] for p in passages]
+            emb = encoder.encode(passages, batch_size=batch_size, show_progress_bar=False)
+            vectors.append(emb.mean(axis=0))
+        return np.vstack(vectors)
+
+    def predict_proba(self, texts: list[str]) -> np.ndarray:
+        X = self.encode_contracts(texts)
+        return np.column_stack([_tfidf_proba_col(est, X) for est in self.estimators_])
+
+
+def train_minilm_lr(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    id_to_clause: dict[int, str],
+    encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    cache_path: str | None = "checkpoints/minilm_embeddings.npz",
+    tune_C: bool = True,
+    artifact_name: str = "MiniLM + LR",
+    verbose: bool = True,
+) -> ModelArtifacts:
+    """Encode contracts with MiniLM (CPU-friendly) + per-label LR on 384-dim embeddings."""
+    from pathlib import Path
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.dummy import DummyClassifier
+    from sklearn.model_selection import GridSearchCV
+
+    train_texts, train_labels = _build_contract_matrix(train_df, id_to_clause)
+    val_texts,   val_labels   = _build_contract_matrix(val_df,   id_to_clause)
+
+    pipeline = _EmbeddingPipeline(encoder_name, estimators=[])
+
+    cache_ok = False
+    if cache_path and Path(cache_path).exists():
+        try:
+            cached = np.load(cache_path)
+            X_train = cached["train"]
+            X_val   = cached["val"]
+            if X_train.shape[0] == len(train_texts) and X_val.shape[0] == len(val_texts):
+                cache_ok = True
+                if verbose:
+                    print(f"Loaded cached MiniLM embeddings from {cache_path}")
+        except Exception:
+            cache_ok = False
+
+    if not cache_ok:
+        if verbose:
+            print(f"Encoding {len(train_texts) + len(val_texts)} contracts with {encoder_name}…")
+        X_train = pipeline.encode_contracts(train_texts)
+        X_val   = pipeline.encode_contracts(val_texts)
+        if cache_path:
+            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+            np.savez(cache_path, train=X_train, val=X_val)
+            if verbose:
+                print(f"Cached embeddings → {cache_path}")
+
+    C_grid = [0.1, 1.0, 10.0]
+    estimators = []
+    for i in range(train_labels.shape[1]):
+        col = train_labels[:, i]
+        if len(np.unique(col)) < 2:
+            est = DummyClassifier(strategy="most_frequent")
+            est.fit(X_train, col)
+        else:
+            n_pos = int(col.sum())
+            n_neg = int(len(col) - n_pos)
+            min_class = min(n_pos, n_neg)
+            cv_safe = min(3, min_class)
+            if tune_C and min_class >= 10:
+                base = LogisticRegression(class_weight="balanced", max_iter=1000, solver="lbfgs")
+                gs = GridSearchCV(base, {"C": C_grid}, cv=cv_safe, scoring="f1", n_jobs=1)
+                gs.fit(X_train, col)
+                best_C = float(gs.best_params_["C"])
+            else:
+                best_C = 1.0
+            est = LogisticRegression(
+                class_weight="balanced", max_iter=1000, C=best_C, solver="lbfgs",
+            )
+            est.fit(X_train, col)
+        estimators.append(est)
+
+    pipeline.estimators_ = estimators
+
+    eps = 1e-7
+    val_probs = np.column_stack([_tfidf_proba_col(est, X_val) for est in estimators])
+    p = np.clip(val_probs, eps, 1 - eps)
+    val_logits = np.log(p / (1 - p))
+
+    best_t, val_metrics = _tune_global_threshold(val_logits, val_labels)
+
+    if verbose:
+        print(f"{artifact_name} → val micro_F1={val_metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+
+    return ModelArtifacts(
+        model_name=artifact_name,
+        model=pipeline,
+        tokenizer=None,
+        best_threshold=best_t,
+        val_metrics=val_metrics,
+        history=pd.DataFrame(),
+        id_to_clause=id_to_clause,
+        val_logits=val_logits,
+        val_labels=val_labels,
+    )
+
+
+# ─── Ensemble helper ────────────────────────────────────────────────────────
+
+
+class _EnsemblePipeline:
+    """Averages probabilities from two pipelines that each expose predict_proba."""
+
+    def __init__(self, pipeline_a, pipeline_b, weight_a: float = 0.5):
+        self.pipeline_a = pipeline_a
+        self.pipeline_b = pipeline_b
+        self.weight_a = weight_a
+
+    def predict_proba(self, texts: list[str]) -> np.ndarray:
+        pa = self.pipeline_a.predict_proba(texts)
+        pb = self.pipeline_b.predict_proba(texts)
+        return self.weight_a * pa + (1.0 - self.weight_a) * pb
+
+
+def ensemble_artifacts(
+    artifacts_a: ModelArtifacts,
+    artifacts_b: ModelArtifacts,
+    weight_a: float | None = 0.5,
+    artifact_name: str = "Ensemble (TF-IDF + MiniLM)",
+    verbose: bool = True,
+) -> ModelArtifacts:
+    """Average two models' validation probabilities and re-tune threshold.
+
+    If ``weight_a`` is None, sweep weights in {0.1, 0.3, 0.5, 0.7, 0.9} and pick the
+    one that maximises micro-F1 on the validation set (one hyperparameter tuned on
+    val — fair for a held-out test set later).
+
+    Assumes both artifacts were evaluated on the same validation set in the same order.
+    """
+    from scipy.special import expit as sigmoid
+
+    pa = sigmoid(artifacts_a.val_logits)
+    pb = sigmoid(artifacts_b.val_logits)
+    val_labels = artifacts_a.val_labels  # same val set
+    eps = 1e-7
+
+    def _logits_for(weight: float) -> np.ndarray:
+        p_avg = weight * pa + (1.0 - weight) * pb
+        p_clip = np.clip(p_avg, eps, 1 - eps)
+        return np.log(p_clip / (1 - p_clip))
+
+    if weight_a is None:
+        candidates = [0.1, 0.3, 0.5, 0.7, 0.9]
+        best_w, best_f1, best_logits, best_t, best_metrics = 0.5, -1.0, None, 0.5, {}
+        for w in candidates:
+            logits_w = _logits_for(w)
+            t_w, metrics_w = _tune_global_threshold(logits_w, val_labels)
+            if metrics_w["micro_f1"] > best_f1:
+                best_w, best_f1, best_logits = w, metrics_w["micro_f1"], logits_w
+                best_t, best_metrics = t_w, metrics_w
+        weight_a = best_w
+        val_logits = best_logits
+        val_metrics = best_metrics
+        best_t_out = best_t
+        if verbose:
+            print(f"  ensemble weight sweep → best weight_a={weight_a} (micro_F1={best_f1:.4f})")
+    else:
+        val_logits = _logits_for(weight_a)
+        best_t_out, val_metrics = _tune_global_threshold(val_logits, val_labels)
+
+    pipeline = _EnsemblePipeline(artifacts_a.model, artifacts_b.model, weight_a=weight_a)
+
+    if verbose:
+        print(f"{artifact_name} → val micro_F1={val_metrics['micro_f1']:.4f}, threshold={best_t_out:.2f}, weight_a={weight_a}")
+
+    return ModelArtifacts(
+        model_name=artifact_name,
+        model=pipeline,
+        tokenizer=None,
+        best_threshold=best_t_out,
+        val_metrics=val_metrics,
+        history=pd.DataFrame(),
+        id_to_clause=artifacts_a.id_to_clause,
+        val_logits=val_logits,
+        val_labels=val_labels,
+    )
+
+
+# ─── Early-fusion hybrid (TF-IDF ⊕ MiniLM embeddings) ──────────────────────
+
+
+class _HybridFeaturePipeline:
+    """Concatenates sparse TF-IDF features with dense MiniLM embeddings at inference.
+
+    predict_proba(texts) -> (n_texts, n_labels) class-1 probabilities.
+    Reuses an already-fit vectorizer and embedding encoder.
+    """
+
+    def __init__(self, vectorizer, embedding_pipeline: "_EmbeddingPipeline",
+                 estimators: list, minilm_scale: float = 1.0):
+        self.vectorizer = vectorizer
+        self.embedding_pipeline = embedding_pipeline
+        self.estimators_ = estimators
+        self.minilm_scale = float(minilm_scale)
+
+    def _transform(self, texts: list[str]):
+        from scipy.sparse import hstack, csr_matrix
+        X_tfidf = self.vectorizer.transform(texts)               # sparse
+        X_emb   = self.embedding_pipeline.encode_contracts(texts)  # dense
+        X_emb   = X_emb * self.minilm_scale
+        return hstack([X_tfidf, csr_matrix(X_emb)]).tocsr()
+
+    def predict_proba(self, texts: list[str]) -> np.ndarray:
+        X = self._transform(texts)
+        return np.column_stack([_tfidf_proba_col(e, X) for e in self.estimators_])
+
+
+def train_hybrid_features_lr(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    id_to_clause: dict[int, str],
+    ngram_word: tuple[int, int] = (1, 3),
+    ngram_char: tuple[int, int] = (3, 5),
+    max_features_word: int = 100_000,
+    max_features_char: int = 50_000,
+    encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    cache_path: str | None = "checkpoints/minilm_embeddings.npz",
+    tune_C: bool = False,
+    minilm_scale: float = 1.0,
+    artifact_name: str = "V7 — Hybrid features (TF-IDF ⊕ MiniLM)",
+    verbose: bool = True,
+) -> ModelArtifacts:
+    """Early-fusion: concatenate TF-IDF (word+char) sparse features with dense MiniLM
+    embeddings and train per-label LR on the joint matrix.
+
+    Usually beats late-fusion (probability averaging) when one model (MiniLM here) is
+    much weaker — the LR learns to weight each feature source per-label rather than
+    forcing a single global weight_a.
+    """
+    from pathlib import Path
+    from scipy.sparse import hstack, csr_matrix
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.dummy import DummyClassifier
+    from sklearn.pipeline import FeatureUnion
+    from sklearn.model_selection import GridSearchCV
+
+    train_texts, train_labels = _build_contract_matrix(train_df, id_to_clause)
+    val_texts,   val_labels   = _build_contract_matrix(val_df,   id_to_clause)
+
+    # 1) TF-IDF (word + char)
+    vectorizer = FeatureUnion([
+        ("word", TfidfVectorizer(
+            analyzer="word", ngram_range=ngram_word,
+            max_features=max_features_word, sublinear_tf=True,
+        )),
+        ("char", TfidfVectorizer(
+            analyzer="char_wb", ngram_range=ngram_char,
+            max_features=max_features_char, sublinear_tf=True,
+        )),
+    ])
+    X_train_tfidf = vectorizer.fit_transform(train_texts)
+    X_val_tfidf   = vectorizer.transform(val_texts)
+
+    # 2) MiniLM embeddings (cached npz: {"train": ..., "val": ...})
+    emb_pipeline = _EmbeddingPipeline(encoder_name, estimators=[])
+    cache_ok = False
+    if cache_path and Path(cache_path).exists():
+        try:
+            cached = np.load(cache_path)
+            X_train_emb, X_val_emb = cached["train"], cached["val"]
+            if (X_train_emb.shape[0] == len(train_texts)
+                and X_val_emb.shape[0] == len(val_texts)):
+                cache_ok = True
+                if verbose:
+                    print(f"Loaded cached MiniLM embeddings from {cache_path}")
+        except Exception:
+            cache_ok = False
+    if not cache_ok:
+        if verbose:
+            print(f"Encoding {len(train_texts) + len(val_texts)} contracts with {encoder_name}…")
+        X_train_emb = emb_pipeline.encode_contracts(train_texts)
+        X_val_emb   = emb_pipeline.encode_contracts(val_texts)
+        if cache_path:
+            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+            np.savez(cache_path, train=X_train_emb, val=X_val_emb)
+
+    # 3) Concatenate. Scale MiniLM features so L2-regularized LR doesn't drown them
+    # under 150k sparse TF-IDF dims (each MiniLM coefficient pays the same regularization
+    # cost as each TF-IDF coefficient; scaling features up lets the LR choose to use them).
+    X_train_emb_scaled = X_train_emb * float(minilm_scale)
+    X_val_emb_scaled   = X_val_emb   * float(minilm_scale)
+    X_train = hstack([X_train_tfidf, csr_matrix(X_train_emb_scaled)]).tocsr()
+    X_val   = hstack([X_val_tfidf,   csr_matrix(X_val_emb_scaled)]).tocsr()
+
+    if verbose:
+        print(f"Hybrid features: {X_train.shape[1]:,} (TF-IDF {X_train_tfidf.shape[1]:,} + MiniLM {X_train_emb.shape[1]} × {minilm_scale})")
+
+    # 4) Per-label LR (same safe-CV logic as v2)
+    C_grid = [0.1, 1.0, 10.0]
+    estimators = []
+    for i in range(train_labels.shape[1]):
+        col = train_labels[:, i]
+        if len(np.unique(col)) < 2:
+            est = DummyClassifier(strategy="most_frequent")
+            est.fit(X_train, col)
+            estimators.append(est)
+            continue
+
+        n_pos = int(col.sum())
+        n_neg = int(len(col) - n_pos)
+        min_class = min(n_pos, n_neg)
+        cv_safe = min(3, min_class)
+
+        if tune_C and min_class >= 10:
+            base = LogisticRegression(class_weight="balanced", max_iter=1000, solver="lbfgs")
+            gs = GridSearchCV(base, {"C": C_grid}, cv=cv_safe, scoring="f1", n_jobs=1)
+            gs.fit(X_train, col)
+            best_C = float(gs.best_params_["C"])
+        else:
+            best_C = 1.0
+
+        est = LogisticRegression(
+            class_weight="balanced", max_iter=1000, C=best_C, solver="lbfgs",
+        )
+        est.fit(X_train, col)
+        estimators.append(est)
+
+    # 5) Probabilities → log-odds for sigmoid-based evaluators
+    eps = 1e-7
+    val_probs = np.column_stack([_tfidf_proba_col(est, X_val) for est in estimators])
+    p = np.clip(val_probs, eps, 1 - eps)
+    val_logits = np.log(p / (1 - p))
+
+    best_t, val_metrics = _tune_global_threshold(val_logits, val_labels)
+
+    # Wire up inference pipeline; emb_pipeline needs estimators=[] (unused) but a live encoder
+    pipeline = _HybridFeaturePipeline(vectorizer, emb_pipeline, estimators, minilm_scale=minilm_scale)
+
+    if verbose:
+        print(f"{artifact_name} → val micro_F1={val_metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+
+    return ModelArtifacts(
+        model_name=artifact_name,
+        model=pipeline,
+        tokenizer=None,
+        best_threshold=best_t,
+        val_metrics=val_metrics,
+        history=pd.DataFrame(),
+        id_to_clause=id_to_clause,
+        val_logits=val_logits,
+        val_labels=val_labels,
     )

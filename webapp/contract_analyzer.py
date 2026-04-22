@@ -36,7 +36,7 @@ def classify_document_type(text: str) -> str:
             },
         ],
     )
-    return resp.choices[0].message.content.strip()
+    return (resp.choices[0].message.content or "Unknown Document Type").strip()
 
 
 def summarize_contract(text: str, doc_type: str) -> str:
@@ -64,7 +64,7 @@ def summarize_contract(text: str, doc_type: str) -> str:
             },
         ],
     )
-    return resp.choices[0].message.content.strip()
+    return (resp.choices[0].message.content or "_Summary unavailable._").strip()
 
 
 def analyze_risks(text: str, flagged_clauses: list[str]) -> list[dict]:
@@ -79,13 +79,15 @@ def analyze_risks(text: str, flagged_clauses: list[str]) -> list[dict]:
     clause_list = "\n".join(f"- {c}" for c in flagged_clauses)
     prompt = (
         "You are a legal risk analyst. The following clause types were detected in a contract.\n"
-        "For each clause, return a JSON array where every element has these exact keys:\n"
-        "  clause (string), risk_level ('Low'|'Medium'|'High'), "
-        "plain_explanation (1–2 sentences in plain English), "
-        "watch_out_for (one concrete thing the signer should be cautious about).\n\n"
+        "Return a JSON object of the form:\n"
+        '  {"clauses": [ {"clause": "...", "risk_level": "Low|Medium|High", '
+        '"plain_explanation": "...", "watch_out_for": "..."}, ... ]}\n'
+        "- clause: the clause type name\n"
+        "- risk_level: one of Low, Medium, or High\n"
+        "- plain_explanation: 1–2 sentences in plain English describing what the clause means\n"
+        "- watch_out_for: one concrete thing the signer should be cautious about\n\n"
         f"Detected clauses:\n{clause_list}\n\n"
-        f"Relevant contract text:\n\n{text[:_MAX_CHARS_RISK]}\n\n"
-        "Return ONLY the JSON array, no other text."
+        f"Relevant contract text:\n\n{text[:_MAX_CHARS_RISK]}"
     )
 
     resp = _client().chat.completions.create(
@@ -98,11 +100,28 @@ def analyze_risks(text: str, flagged_clauses: list[str]) -> list[dict]:
         response_format={"type": "json_object"},
     )
 
-    raw = resp.choices[0].message.content.strip()
+    raw = resp.choices[0].message.content
+    if not raw:
+        # Model returned empty content (content filter or refusal) — degrade gracefully
+        return [
+            {
+                "clause": c,
+                "risk_level": "Unknown",
+                "plain_explanation": "The model could not generate an explanation for this clause.",
+                "watch_out_for": "Review this clause manually.",
+            }
+            for c in flagged_clauses
+        ]
+
     parsed = json.loads(raw)
 
-    # GPT-4o with json_object wraps in an object; unwrap if needed
+    # Expecting {"clauses": [...]}; fall back to first list-valued key
     if isinstance(parsed, dict):
-        parsed = next(iter(parsed.values()))
+        if "clauses" in parsed and isinstance(parsed["clauses"], list):
+            return parsed["clauses"]
+        for value in parsed.values():
+            if isinstance(value, list):
+                return value
+        return []
 
     return parsed if isinstance(parsed, list) else []
