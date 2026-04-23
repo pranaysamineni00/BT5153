@@ -182,7 +182,7 @@ def _run_training_loop(
 
     # Mixed precision: ~1.5-2x speedup on CUDA (T4/V100/A100). No-op on CPU/MPS.
     use_amp = device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
     best_state: dict | None = None
     best_t = 0.5
@@ -202,7 +202,7 @@ def _run_training_loop(
             inputs = {k: v.to(device) for k, v in batch.items() if k != "labels"}
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast('cuda', enabled=use_amp):
                 logits = model(**inputs).logits
                 # Per-sample down-weighting: all-negative chunks get weight 0.1.
                 # Computed directly from the batch labels so it is correct under shuffle.
@@ -235,7 +235,8 @@ def _run_training_loop(
         history_rows.append({"epoch": epoch, "train_loss": total_loss / max(1, seen),
                               "val_threshold": t, **metrics})
         print(f"  Epoch {epoch}/{epochs}: loss={total_loss / max(1, seen):.4f}  "
-              f"val micro_F1={metrics['micro_f1']:.4f}  val macro_F1={metrics['macro_f1']:.4f}")
+              f"val micro_F1={metrics['micro_f1']:.4f}  val macro_F1={metrics['macro_f1']:.4f}",
+              flush=True)
 
         if metrics["macro_f1"] > best_metrics["macro_f1"]:
             best_metrics = metrics
@@ -449,7 +450,7 @@ def train_bert_ledgar_cuad(
     optimizer_p1 = torch.optim.AdamW(ledgar_model.parameters(), lr=learning_rate, weight_decay=0.01)
     ce_loss = torch.nn.CrossEntropyLoss()
     use_amp = device.type == "cuda"
-    scaler_p1 = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler_p1 = torch.amp.GradScaler('cuda', enabled=use_amp)
 
     for epoch in range(1, ledgar_epochs + 1):
         ledgar_model.train()
@@ -460,7 +461,7 @@ def train_bert_ledgar_cuad(
             labels = batch["labels"].to(device)
             inputs = {k: v.to(device) for k, v in batch.items() if k != "labels"}
             optimizer_p1.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast('cuda', enabled=use_amp):
                 logits = ledgar_model(**inputs).logits
                 loss = ce_loss(logits, labels)
             scaler_p1.scale(loss).backward()
@@ -739,6 +740,7 @@ def train_longformer_ledgar_cuad(
     longformer_name: str = "allenai/longformer-base-4096",
     ledgar_epochs: int = 2,
     ledgar_max_batches: int | None = None,
+    ledgar_batch_size: int = 32,
     cuad_epochs: int = 3,
     cuad_max_train_batches: int | None = None,
     cuad_max_val_batches: int | None = None,
@@ -760,7 +762,7 @@ def train_longformer_ledgar_cuad(
     _pin = device.type == "cuda"
 
     # ── Phase 1: LEDGAR fine-tuning ───────────────────────────────────────────
-    print("Phase 1: domain-adapting Longformer on LEDGAR...")
+    print("Phase 1: domain-adapting Longformer on LEDGAR...", flush=True)
     ledgar_train = ledgar_dataset["train"]
     n_ledgar_labels = ledgar_train.features["label"].num_classes
 
@@ -775,8 +777,10 @@ def train_longformer_ledgar_cuad(
             batch["text"], truncation=True, padding="max_length", max_length=512
         )
 
-    ledgar_tok = ledgar_train.map(_tokenize_ledgar, batched=True)
+    print(f"  Tokenizing {len(ledgar_train):,} LEDGAR examples...", flush=True)
+    ledgar_tok = ledgar_train.map(_tokenize_ledgar, batched=True, num_proc=4)
     ledgar_tok.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
+    print(f"  Tokenization complete.", flush=True)
 
     class _LFLedgarDataset(TorchDataset):
         def __init__(self, hf_ds):
@@ -791,14 +795,16 @@ def train_longformer_ledgar_cuad(
                 "labels":         item["label"],
             }
 
+    # ledgar_batch_size decouples Phase 1 batch size from Phase 2:
+    # Phase 1 uses 512-token sequences so a much larger batch is safe on H100.
     ledgar_loader = TorchDataLoader(
-        _LFLedgarDataset(ledgar_tok), batch_size=batch_size, shuffle=True,
+        _LFLedgarDataset(ledgar_tok), batch_size=ledgar_batch_size, shuffle=True,
         num_workers=2, pin_memory=_pin, persistent_workers=True,
     )
     optimizer_p1 = torch.optim.AdamW(ledgar_model.parameters(), lr=learning_rate, weight_decay=0.01)
     ce_loss = torch.nn.CrossEntropyLoss()
     use_amp = device.type == "cuda"
-    scaler_p1 = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler_p1 = torch.amp.GradScaler('cuda', enabled=use_amp)
 
     for epoch in range(1, ledgar_epochs + 1):
         ledgar_model.train()
@@ -809,7 +815,7 @@ def train_longformer_ledgar_cuad(
             labels = batch["labels"].to(device)
             inputs = {k: v.to(device) for k, v in batch.items() if k != "labels"}
             optimizer_p1.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.amp.autocast('cuda', enabled=use_amp):
                 logits = ledgar_model(**inputs).logits
                 loss = ce_loss(logits, labels)
             scaler_p1.scale(loss).backward()
@@ -817,10 +823,10 @@ def train_longformer_ledgar_cuad(
             scaler_p1.update()
             total_loss += float(loss.item())
             seen += 1
-        print(f"  LEDGAR epoch {epoch}: loss={total_loss / max(1, seen):.4f}")
+        print(f"  LEDGAR epoch {epoch}: loss={total_loss / max(1, seen):.4f}", flush=True)
 
     # ── Phase 2: transfer backbone to CUAD ───────────────────────────────────
-    print("Phase 2: transferring Longformer backbone to CUAD multi-label task...")
+    print("Phase 2: transferring Longformer backbone to CUAD multi-label task...", flush=True)
     backbone_state = {
         k: v for k, v in ledgar_model.state_dict().items()
         if not k.startswith("classifier")
