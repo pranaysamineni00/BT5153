@@ -197,6 +197,61 @@ def plot_confusion_matrix(
     plt.close(fig)
 
 
+def plot_precision_recall_curves(
+    logits_dict: dict[str, np.ndarray],
+    labels_dict: dict[str, np.ndarray],
+    save_path: str | None = None,
+) -> None:
+    """Macro-averaged precision-recall curve for each model.
+
+    For each model, per-label PR curves are interpolated onto a shared recall
+    axis and averaged, giving a threshold-independent view of ranking quality.
+    """
+    import matplotlib.pyplot as plt
+
+    recall_base = np.linspace(0, 1, 101)
+    fig, ax = plt.subplots(figsize=(9, 6))
+    fig.patch.set_facecolor("white")
+    colors = plt.cm.tab10.colors
+
+    for idx, (model_name, logits) in enumerate(logits_dict.items()):
+        labels = labels_dict[model_name]
+        probs = _sigmoid(logits)
+        n_labels = logits.shape[1]
+        interp_precisions = []
+
+        for j in range(n_labels):
+            y_true = labels[:, j].astype(int)
+            if y_true.sum() == 0:
+                continue
+            prec, rec, _ = precision_recall_curve(y_true, probs[:, j])
+            # Interpolate onto common recall grid (curve sorted ascending)
+            interp_precisions.append(np.interp(recall_base, rec[::-1], prec[::-1]))
+
+        if not interp_precisions:
+            continue
+        mean_prec = np.mean(interp_precisions, axis=0)
+        aupr = float(average_precision_score(labels.astype(int), probs, average="macro"))
+        ax.plot(recall_base, mean_prec,
+                label=f"{model_name} (AUPR={aupr:.3f})",
+                color=colors[idx % len(colors)], linewidth=1.8)
+
+    ax.set_xlabel("Recall", fontsize=11)
+    ax.set_ylabel("Precision", fontsize=11)
+    ax.set_title("Macro-Averaged Precision–Recall Curves — All Models",
+                 fontsize=12, fontweight="bold", pad=12)
+    ax.legend(fontsize=9, loc="upper right")
+    ax.set_xlim([0, 1])
+    ax.set_ylim([0, 1.02])
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    else:
+        plt.show()
+    plt.close(fig)
+
+
 def plot_model_comparison(
     results: dict[str, pd.DataFrame],
     metric: str = "f1",

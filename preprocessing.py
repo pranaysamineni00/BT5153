@@ -284,16 +284,26 @@ def compute_sample_weights(
     return weights
 
 
-def compute_pos_weight(chunk_examples: list[dict[str, Any]]) -> torch.Tensor:
+def compute_pos_weight(
+    chunk_examples: list[dict[str, Any]],
+    rare_threshold: int = 30,
+    rare_boost: float = 2.0,
+    max_weight: float = 50.0,
+) -> torch.Tensor:
     """Per-label pos_weight tensor for BCEWithLogitsLoss: neg_count / pos_count.
 
-    Tells the loss function to penalise missed positives more heavily for rare labels.
+    Clause types with fewer than rare_threshold positive chunks receive a rare_boost
+    multiplier before capping, giving the loss function stronger signal on tail classes
+    without changing the weighting formula for common clause types.
+    max_weight raised to 50 (from 10) so natural neg/pos ratios for mid-rare classes
+    are not suppressed.
     """
     label_matrix = np.asarray([ex["labels"] for ex in chunk_examples], dtype=np.float32)
     positive_counts = label_matrix.sum(axis=0)
     negative_counts = len(label_matrix) - positive_counts
     weights = np.where(positive_counts > 0, negative_counts / np.maximum(positive_counts, 1.0), 1.0)
-    weights = np.clip(weights, 0, 10.0)
+    weights = np.where(positive_counts < rare_threshold, weights * rare_boost, weights)
+    weights = np.clip(weights, 0, max_weight)
     return torch.tensor(weights, dtype=torch.float32)
 
 
