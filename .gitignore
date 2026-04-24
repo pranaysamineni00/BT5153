@@ -1,12 +1,24 @@
-.streamlit/secrets.toml
 .claude/
+
+# Python bytecode & caches
 __pycache__/
 **/__pycache__/
-.DS_Store
-**/.DS_Store
-webapp/__pycache__/
-tests/__pycache__/
+*.pyc
+*.pyo
 .pytest_cache/
 .ipynb_checkpoints/
+
+# Virtual envs
+venv/
+.venv/
+
+# OS junk
+.DS_Store
+**/.DS_Store
+
+# Secrets (Streamlit app retired, left for safety if .streamlit/ ever returns)
+.streamlit/secrets.toml
+
+# Large / generated artifacts
 checkpoints/
 data/
