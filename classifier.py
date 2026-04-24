@@ -421,7 +421,8 @@ def _extract_paragraph(text: str, match_start: int, match_end: int) -> str:
 
 
 def _find_snippet(text: str, clause: str) -> str:
-    """Primary: keyword-regex search for the paragraph containing clause language."""
+    """Keyword-regex search for the paragraph containing clause language. Used only as a
+    last-resort fallback constrained to a window the model already identified."""
     for pattern in _KW.get(clause, []):
         m = re.search(pattern, text, re.IGNORECASE)
         if m:
@@ -430,7 +431,7 @@ def _find_snippet(text: str, clause: str) -> str:
 
 
 def _find_snippet_by_terms(text: str, clause: str) -> str:
-    """Fallback: score paragraphs by clause-name term density when no keyword fires."""
+    """Term-density fallback. Used only as a last-resort within a model-identified window."""
     _STOP = {'of', 'or', 'and', 'the', 'a', 'an', 'to', 'in', 'for', 'on', 'at', 'not'}
     terms = [w.lower() for w in re.split(r'[\s/\-]+', clause)
              if w.lower() not in _STOP and len(w) > 2]
@@ -449,6 +450,49 @@ def _find_snippet_by_terms(text: str, clause: str) -> str:
     if len(best_para) > 700:
         best_para = best_para[:700].rsplit(' ', 1)[0] + '…'
     return best_para
+
+
+def _candidate_spans(text: str, min_len: int = 60, max_len: int = 1200) -> list[str]:
+    """Split a window into clause-sized candidate spans for model rescoring.
+
+    Prefers paragraph breaks; merges fragments shorter than min_len with neighbors;
+    splits paragraphs longer than max_len on sentence boundaries. Generalizes across
+    legal documents — no hardcoded section names or keywords."""
+    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
+    if not paragraphs:
+        paragraphs = [text.strip()] if text.strip() else []
+
+    out: list[str] = []
+    for p in paragraphs:
+        if len(p) > max_len:
+            # Split overlong paragraphs on sentence boundaries
+            sents = re.split(r'(?<=[.!?])\s+(?=[A-Z(])', p)
+            cur = ""
+            for s in sents:
+                if cur and len(cur) + len(s) + 1 > max_len:
+                    out.append(cur)
+                    cur = s
+                else:
+                    cur = (cur + ' ' + s).strip() if cur else s
+            if cur:
+                out.append(cur)
+        elif len(p) < min_len and out and len(out[-1]) + len(p) + 1 <= max_len:
+            out[-1] = (out[-1] + ' ' + p).strip()
+        else:
+            out.append(p)
+
+    return [c for c in out if len(c) >= 30]
+
+
+def _trim_snippet(snippet: str, max_chars: int = 700) -> str:
+    """Trim a snippet to max_chars at a clean word boundary."""
+    if len(snippet) <= max_chars:
+        return snippet
+    trimmed = snippet[:max_chars]
+    cut = trimmed.rfind(' ')
+    if cut > max_chars - 100:
+        trimmed = trimmed[:cut]
+    return trimmed.rstrip() + '…'
 
 
 def _classify_heuristic(text: str) -> list[dict]:
@@ -539,22 +583,69 @@ class LegalClauseClassifier:
         except Exception as exc:
             raise RuntimeError(f"Checkpoint load failed: {exc}") from exc
 
-    def _classify_model(self, text: str) -> list[dict]:
+    def _rescore_candidates(self, candidates: list[str], batch_size: int = 8) -> np.ndarray:
+        """Run the same fine-tuned model over short candidate spans. Returns
+        an (n_candidates, n_labels) probability matrix. Used to align retrieval
+        with detection — the snippet shown is literally the span the model
+        scores highest for the detected label."""
         import torch
 
-        enc = self.tokenizer(
-            text,
-            max_length=512,
-            stride=128,
-            truncation=True,
-            padding="max_length",
-            return_overflowing_tokens=True,
-        )
-
         n_labels = len(self.id_to_clause)
-        max_probs = np.zeros(n_labels, dtype=np.float32)
+        if not candidates:
+            return np.zeros((0, n_labels), dtype=np.float32)
 
-        for i in range(len(enc["input_ids"])):
+        probs_all = np.zeros((len(candidates), n_labels), dtype=np.float32)
+        for start in range(0, len(candidates), batch_size):
+            batch = candidates[start:start + batch_size]
+            enc = self.tokenizer(
+                batch,
+                max_length=512,
+                truncation=True,
+                padding=True,
+                return_tensors="pt",
+            )
+            enc = {k: v.to(self._device) for k, v in enc.items()}
+            with torch.no_grad():
+                logits = self.model(**enc).logits.cpu().numpy()
+            probs_all[start:start + len(batch)] = 1.0 / (1.0 + np.exp(-np.clip(logits, -500, 500)))
+        return probs_all
+
+    def _classify_model(self, text: str) -> list[dict]:
+        """Detect clauses and locate their supporting spans using the SAME model
+        for both. The window where label X scores highest is, by construction, the
+        strongest evidence span for X. We then rescore paragraph-sized candidates
+        within that window to pick the most evidentiary excerpt — eliminating the
+        keyword/term-density mismatch the prior architecture produced."""
+        import torch
+
+        # Try fast tokenizer with offset mapping; fall back gracefully if unavailable.
+        try:
+            enc = self.tokenizer(
+                text,
+                max_length=512,
+                stride=128,
+                truncation=True,
+                padding="max_length",
+                return_overflowing_tokens=True,
+                return_offsets_mapping=True,
+            )
+            offsets_available = True
+        except (NotImplementedError, ValueError):
+            enc = self.tokenizer(
+                text,
+                max_length=512,
+                stride=128,
+                truncation=True,
+                padding="max_length",
+                return_overflowing_tokens=True,
+            )
+            offsets_available = False
+
+        n_windows = len(enc["input_ids"])
+        n_labels = len(self.id_to_clause)
+        window_probs = np.zeros((n_windows, n_labels), dtype=np.float32)
+
+        for i in range(n_windows):
             ids = torch.tensor(enc["input_ids"][i:i+1], dtype=torch.long).to(self._device)
             mask = torch.tensor(enc["attention_mask"][i:i+1], dtype=torch.long).to(self._device)
             inputs: dict = {"input_ids": ids, "attention_mask": mask}
@@ -566,24 +657,74 @@ class LegalClauseClassifier:
             with torch.no_grad():
                 logits = self.model(**inputs).logits.cpu().numpy()[0]
 
-            probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -500, 500)))
-            for j in range(n_labels):
-                if probs[j] > max_probs[j]:
-                    max_probs[j] = probs[j]
+            window_probs[i] = 1.0 / (1.0 + np.exp(-np.clip(logits, -500, 500)))
 
-        results: list[dict] = []
+        max_probs = window_probs.max(axis=0) if n_windows else np.zeros(n_labels, dtype=np.float32)
+        best_windows = window_probs.argmax(axis=0) if n_windows else np.zeros(n_labels, dtype=np.int64)
+
+        # Map each window to its character span in the source text (Fast tokenizer path)
+        window_spans: list[tuple[int, int]] = []
+        if offsets_available:
+            for i in range(n_windows):
+                offsets = enc["offset_mapping"][i]
+                real = [(s, e) for s, e in offsets if e > s]
+                window_spans.append((real[0][0], real[-1][1]) if real else (0, len(text)))
+        else:
+            # No offsets — treat the whole document as one window for fallback purposes
+            window_spans = [(0, len(text))] * max(n_windows, 1)
+
+        # Identify detected clauses
+        detected: list[tuple[int, str, float]] = []
         for label_id, clause_name in self.id_to_clause.items():
             t = self.thresholds.get(clause_name, 0.5)
             prob = float(max_probs[label_id])
             if prob >= t:
-                results.append({
-                    "clause":     clause_name,
-                    "confidence": round(prob, 3),
-                    "risk":       RISK_LEVELS.get(clause_name, "LOW"),
-                    "category":   _get_category(clause_name),
-                    "snippet":    _find_snippet(text, clause_name) or _find_snippet_by_terms(text, clause_name),
-                    "detected":   True,
-                })
+                detected.append((label_id, clause_name, prob))
+
+        # Build a deduped candidate pool from each winning window. Each candidate
+        # paragraph carries its source-window id so we can match it back to clauses.
+        candidates: list[str] = []
+        candidate_window: list[int] = []
+        if detected:
+            winning_windows = sorted({int(best_windows[lid]) for lid, _, _ in detected})
+            for w in winning_windows:
+                ws, we = window_spans[w]
+                window_text = text[ws:we]
+                for cand in _candidate_spans(window_text):
+                    candidates.append(cand)
+                    candidate_window.append(w)
+
+        cand_probs = self._rescore_candidates(candidates)
+
+        # Pick the highest-scoring candidate within each clause's winning window
+        results: list[dict] = []
+        for label_id, clause_name, prob in detected:
+            best_w = int(best_windows[label_id])
+            snippet = ""
+            best_score = -1.0
+            for j, w in enumerate(candidate_window):
+                if w == best_w and cand_probs[j, label_id] > best_score:
+                    best_score = float(cand_probs[j, label_id])
+                    snippet = candidates[j]
+
+            # Last-resort fallback: keyword/term search constrained to the winning window
+            if not snippet:
+                ws, we = window_spans[best_w]
+                window_text = text[ws:we]
+                snippet = (
+                    _find_snippet(window_text, clause_name)
+                    or _find_snippet_by_terms(window_text, clause_name)
+                    or window_text
+                )
+
+            results.append({
+                "clause":     clause_name,
+                "confidence": round(prob, 3),
+                "risk":       RISK_LEVELS.get(clause_name, "LOW"),
+                "category":   _get_category(clause_name),
+                "snippet":    _trim_snippet(snippet),
+                "detected":   True,
+            })
 
         results.sort(key=lambda x: x["confidence"], reverse=True)
         return results

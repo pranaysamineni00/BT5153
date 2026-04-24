@@ -1,4 +1,5 @@
 """Kill any existing server on port 5001 and launch the LexScan dashboard."""
+import socket
 import subprocess
 import sys
 import time
@@ -20,6 +21,17 @@ def kill_port(port: int) -> None:
         print(f"Killed process {pid} on port {port}.")
 
 
+def wait_for_server(port: int, timeout: float = 30.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.25)
+    return False
+
+
 def main() -> None:
     kill_port(PORT)
     time.sleep(0.5)
@@ -30,7 +42,10 @@ def main() -> None:
     )
 
     print(f"Server starting (PID {server.pid})…")
-    time.sleep(3)
+    if not wait_for_server(PORT):
+        print("Server did not become ready in time.")
+        server.terminate()
+        sys.exit(1)
 
     webbrowser.open(URL)
     print(f"Opened {URL}")
