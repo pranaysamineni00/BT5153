@@ -1,6 +1,9 @@
 .streamlit/secrets.toml
 .claude/
 __pycache__/
+**/__pycache__/
+.DS_Store
+**/.DS_Store
 webapp/__pycache__/
 tests/__pycache__/
 .pytest_cache/

@@ -657,6 +657,151 @@ def train_legalbert_longformer_cuad(
     )
 
 
+def train_longformer_ledgar_cuad(
+    ledgar_dataset: Any,
+    train_dataset: MultiLabelChunkDataset,
+    val_dataset: MultiLabelChunkDataset,
+    train_examples: list[dict],
+    tokenizer: Any,
+    id_to_clause: dict[int, str],
+    val_examples: list[dict] | None = None,
+    longformer_name: str = "allenai/longformer-base-4096",
+    ledgar_epochs: int = 2,
+    ledgar_max_batches: int | None = None,
+    ledgar_batch_size: int = 32,
+    cuad_epochs: int = 3,
+    cuad_max_train_batches: int | None = None,
+    cuad_max_val_batches: int | None = None,
+    batch_size: int = 4,
+    learning_rate: float = 2e-5,
+    device: torch.device | None = None,
+) -> ModelArtifacts:
+    """Two-phase training: (1) fine-tune Longformer-base on LEDGAR, (2) transfer to CUAD.
+
+    Unlike train_legalbert_longformer_cuad, this does NOT copy Legal-BERT weights with
+    512→4096 position-embedding tiling. It domain-adapts Longformer's native position
+    embeddings on LEDGAR, keeping all 4096 positions properly trained.
+    Both phases use local-only attention (no global_attention_mask), consistent with
+    train_longformer_cuad and the CUAD test evaluation in Section 4.
+    """
+    from torch.utils.data import Dataset as TorchDataset, DataLoader as TorchDataLoader
+
+    device = device or choose_device()
+    _pin = device.type == "cuda"
+
+    # ── Phase 1: LEDGAR fine-tuning ───────────────────────────────────────────
+    print("Phase 1: domain-adapting Longformer on LEDGAR...", flush=True)
+    ledgar_train = ledgar_dataset["train"]
+    n_ledgar_labels = ledgar_train.features["label"].num_classes
+
+    ledgar_model = AutoModelForSequenceClassification.from_pretrained(
+        longformer_name, num_labels=n_ledgar_labels,
+    ).to(device)
+    ledgar_model.config.use_cache = False
+    ledgar_model.gradient_checkpointing_enable()
+
+    def _tokenize_ledgar(batch: dict) -> dict:
+        return tokenizer(
+            batch["text"], truncation=True, padding="max_length", max_length=512
+        )
+
+    print(f"  Tokenizing {len(ledgar_train):,} LEDGAR examples...", flush=True)
+    ledgar_tok = ledgar_train.map(_tokenize_ledgar, batched=True, num_proc=4)
+    ledgar_tok.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
+    print(f"  Tokenization complete.", flush=True)
+
+    class _LFLedgarDataset(TorchDataset):
+        def __init__(self, hf_ds):
+            self.ds = hf_ds
+        def __len__(self):
+            return len(self.ds)
+        def __getitem__(self, i):
+            item = self.ds[i]
+            return {
+                "input_ids":      item["input_ids"],
+                "attention_mask": item["attention_mask"],
+                "labels":         item["label"],
+            }
+
+    # ledgar_batch_size decouples Phase 1 batch size from Phase 2:
+    # Phase 1 uses 512-token sequences so a much larger batch is safe on H100.
+    ledgar_loader = TorchDataLoader(
+        _LFLedgarDataset(ledgar_tok), batch_size=ledgar_batch_size, shuffle=True,
+        num_workers=2, pin_memory=_pin, persistent_workers=True,
+    )
+    optimizer_p1 = torch.optim.AdamW(ledgar_model.parameters(), lr=learning_rate, weight_decay=0.01)
+    ce_loss = torch.nn.CrossEntropyLoss()
+    use_amp = device.type == "cuda"
+    scaler_p1 = torch.amp.GradScaler('cuda', enabled=use_amp)
+
+    for epoch in range(1, ledgar_epochs + 1):
+        ledgar_model.train()
+        total_loss, seen = 0.0, 0
+        for bi, batch in enumerate(ledgar_loader):
+            if ledgar_max_batches is not None and bi >= ledgar_max_batches:
+                break
+            labels = batch["labels"].to(device)
+            inputs = {k: v.to(device) for k, v in batch.items() if k != "labels"}
+            optimizer_p1.zero_grad(set_to_none=True)
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                logits = ledgar_model(**inputs).logits
+                loss = ce_loss(logits, labels)
+            scaler_p1.scale(loss).backward()
+            scaler_p1.step(optimizer_p1)
+            scaler_p1.update()
+            total_loss += float(loss.item())
+            seen += 1
+        print(f"  LEDGAR epoch {epoch}: loss={total_loss / max(1, seen):.4f}", flush=True)
+
+    # ── Phase 2: transfer backbone to CUAD ───────────────────────────────────
+    print("Phase 2: transferring Longformer backbone to CUAD multi-label task...", flush=True)
+    backbone_state = {
+        k: v for k, v in ledgar_model.state_dict().items()
+        if not k.startswith("classifier")
+    }
+    del ledgar_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    label2id = {v: k for k, v in id_to_clause.items()}
+    cuad_model = AutoModelForSequenceClassification.from_pretrained(
+        longformer_name,
+        num_labels=len(id_to_clause),
+        id2label=id_to_clause,
+        label2id=label2id,
+        problem_type="multi_label_classification",
+        ignore_mismatched_sizes=True,
+    )
+    missing, unexpected = cuad_model.load_state_dict(backbone_state, strict=False)
+    print(f"  Transferred {len(backbone_state)} layers; "
+          f"missing={len(missing)}, unexpected={len(unexpected)}")
+    cuad_model = cuad_model.to(device)
+    cuad_model.config.use_cache = False
+    cuad_model.gradient_checkpointing_enable()
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
+                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+
+    model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
+        cuad_model, train_loader, val_loader, train_examples, val_examples or [], device,
+        epochs=cuad_epochs,
+        learning_rate=learning_rate,
+        weight_decay=0.01,
+        warmup_ratio=0.1,
+        max_train_batches=cuad_max_train_batches,
+        max_val_batches=cuad_max_val_batches,
+    )
+    print(f"Longformer (LEDGAR→CUAD) → val micro_F1={metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+    return ModelArtifacts(
+        model_name="Longformer (LEDGAR→CUAD)",
+        model=model, tokenizer=tokenizer,
+        best_threshold=best_t, val_metrics=metrics, history=history,
+        id_to_clause=id_to_clause, val_logits=val_logits, val_labels=val_labels,
+    )
+
+
 class _LedgarDataset(torch.utils.data.Dataset):
     def __init__(self, hf_ds):
         self.ds = hf_ds

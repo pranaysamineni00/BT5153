@@ -50,27 +50,56 @@ def filter_clauses(
 
 
 def plot_clause_frequency(cuad_df: pd.DataFrame, save_path: str | None = None) -> pd.DataFrame:
-    """Bar chart: positive rate per clause type, sorted descending."""
+    """Horizontal bar chart: positive rate per clause type, colour-coded by rate quartile."""
     import matplotlib.pyplot as plt
-    import seaborn as sns
+    import matplotlib as mpl
+    import numpy as np
+
     summary = (
         cuad_df.groupby("clause_type")["has_answer"]
         .agg(positive_rate="mean", positive_count="sum", total="count")
-        .sort_values("positive_rate", ascending=False)
+        .sort_values("positive_rate", ascending=True)   # ascending so top is at chart top
         .reset_index()
     )
-    fig, ax = plt.subplots(figsize=(14, 8))
-    sns.barplot(data=summary, x="positive_rate", y="clause_type", ax=ax, palette="crest")
-    ax.set_title("Positive Rate per Clause Type (CUAD)")
-    ax.set_xlabel("Positive Rate")
+
+    # Colour bars by quartile: dark blue (high) → light blue (low)
+    cmap = mpl.colormaps.get_cmap("Blues")
+    norm = mpl.colors.Normalize(vmin=summary["positive_rate"].min(),
+                                vmax=summary["positive_rate"].max())
+    bar_colors = [cmap(norm(v) * 0.75 + 0.2) for v in summary["positive_rate"]]
+
+    fig, ax = plt.subplots(figsize=(14, max(9, len(summary) * 0.32)))
+    ax.set_facecolor("#F8F9FA")
+    fig.patch.set_facecolor("white")
+
+    bars = ax.barh(summary["clause_type"], summary["positive_rate"],
+                   color=bar_colors, edgecolor="white", linewidth=0.6, height=0.72)
+
+    # Value labels on each bar
+    for bar, val in zip(bars, summary["positive_rate"]):
+        ax.text(val + 0.005, bar.get_y() + bar.get_height() / 2,
+                f"{val:.0%}", va="center", ha="left", fontsize=7.5, color="#333333")
+
+    ax.axvline(x=0.2, color="#E07B3F", linestyle="--", linewidth=1.4,
+               alpha=0.85, label="20% rate threshold")
+    ax.set_title("Positive Rate per Clause Type — CUAD", fontsize=13,
+                 fontweight="bold", pad=12)
+    ax.set_xlabel("Positive rate", fontsize=10)
     ax.set_ylabel("")
-    ax.axvline(x=0.2, color="red", linestyle="--", alpha=0.6, label="20% threshold")
-    ax.legend()
+    ax.set_xlim(0, min(1.0, summary["positive_rate"].max() * 1.18))
+    ax.tick_params(axis="y", labelsize=8.5)
+    ax.xaxis.grid(True, alpha=0.45, color="#E4E4E4")
+    ax.set_axisbelow(True)
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+    ax.legend(fontsize=9, framealpha=0.85)
+
     plt.tight_layout()
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
     else:
         plt.show()
+    plt.close(fig)
     return summary
 
 
@@ -255,15 +284,26 @@ def compute_sample_weights(
     return weights
 
 
-def compute_pos_weight(chunk_examples: list[dict[str, Any]]) -> torch.Tensor:
+def compute_pos_weight(
+    chunk_examples: list[dict[str, Any]],
+    rare_threshold: int = 30,
+    rare_boost: float = 2.0,
+    max_weight: float = 50.0,
+) -> torch.Tensor:
     """Per-label pos_weight tensor for BCEWithLogitsLoss: neg_count / pos_count.
 
-    Tells the loss function to penalise missed positives more heavily for rare labels.
+    Clause types with fewer than rare_threshold positive chunks receive a rare_boost
+    multiplier before capping, giving the loss function stronger signal on tail classes
+    without changing the weighting formula for common clause types.
+    max_weight raised to 50 (from 10) so natural neg/pos ratios for mid-rare classes
+    are not suppressed.
     """
     label_matrix = np.asarray([ex["labels"] for ex in chunk_examples], dtype=np.float32)
     positive_counts = label_matrix.sum(axis=0)
     negative_counts = len(label_matrix) - positive_counts
     weights = np.where(positive_counts > 0, negative_counts / np.maximum(positive_counts, 1.0), 1.0)
+    weights = np.where(positive_counts < rare_threshold, weights * rare_boost, weights)
+    weights = np.clip(weights, 0, max_weight)
     return torch.tensor(weights, dtype=torch.float32)
 
 
