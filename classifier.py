@@ -94,6 +94,28 @@ def _get_category(clause: str) -> str:
     return "General"
 
 
+def _classifier_mode_preference() -> str:
+    value = os.getenv("LEXSCAN_CLASSIFIER_MODE", "auto").strip().lower()
+    return value if value in {"auto", "model", "baseline", "heuristic"} else "auto"
+
+
+def _resolve_torch_device(torch):
+    requested = os.getenv("LEXSCAN_TORCH_DEVICE", "auto").strip().lower()
+    if requested and requested != "auto":
+        if requested == "cuda" and not torch.cuda.is_available():
+            logger.warning("LEXSCAN_TORCH_DEVICE=cuda requested, but CUDA is unavailable.")
+        elif requested == "mps" and not torch.backends.mps.is_available():
+            logger.warning("LEXSCAN_TORCH_DEVICE=mps requested, but MPS is unavailable.")
+        else:
+            return torch.device(requested)
+
+    return torch.device(
+        "cuda" if torch.cuda.is_available()
+        else "mps" if torch.backends.mps.is_available()
+        else "cpu"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Keyword patterns for heuristic mode
 # ─────────────────────────────────────────────────────────────────────────────
@@ -537,29 +559,103 @@ class LegalClauseClassifier:
         self.id_to_clause: dict[int, str] = {}
         self.thresholds: dict[str, float] = {}
         self._device = None
+        self._mode_preference = _classifier_mode_preference()
 
         if checkpoint_path is None:
             checkpoint_path = str(Path(__file__).parent / "models" / "Legal-BERT_(CUAD).pt")
+        baseline_path = str(Path(__file__).parent / "checkpoints" / "tfidf_lr_artifacts.joblib")
+
+        if self._mode_preference == "heuristic":
+            logger.info("Classifier mode forced to heuristic via LEXSCAN_CLASSIFIER_MODE.")
+            return
 
         if os.path.exists(checkpoint_path):
             self._load_checkpoint(checkpoint_path)
-        else:
-            # Stay in heuristic mode — regex fallback handles classification.
+            return
+
+        if os.path.exists(baseline_path):
+            self._load_tfidf_baseline(baseline_path)
+            return
+
+        if self._mode_preference == "baseline":
             logger.warning(
-                "Model checkpoint not found at %s — running in heuristic (regex) mode.",
-                checkpoint_path,
+                "LEXSCAN_CLASSIFIER_MODE=baseline was requested, but %s is missing.",
+                baseline_path,
             )
+        elif self._mode_preference == "model":
+            logger.warning(
+                "LEXSCAN_CLASSIFIER_MODE=model was requested, but the checkpoint is missing."
+            )
+
+        # Stay in heuristic mode — regex fallback handles classification.
+        logger.warning(
+            "No model artifacts found at %s or %s — running in heuristic (regex) mode.",
+            checkpoint_path,
+            baseline_path,
+        )
+
+    def _load_tfidf_baseline(self, path: str) -> None:
+        try:
+            import joblib
+
+            payload = joblib.load(path)
+            model = payload["model"]
+            id_to_clause = payload["id_to_clause"]
+            best_threshold = float(payload.get("best_threshold", 0.5))
+
+            self.model = model
+            self.tokenizer = None
+            self.id_to_clause = {int(k): v for k, v in id_to_clause.items()}
+            self.thresholds = {clause: best_threshold for clause in self.id_to_clause.values()}
+            self._device = None
+            self.mode = "baseline"
+
+            logger.info("Loaded TF-IDF + LR baseline from %s.", path)
+            logger.info("Baseline threshold: %.3f", best_threshold)
+        except Exception as exc:
+            raise RuntimeError(f"TF-IDF baseline load failed: {exc}") from exc
+
+    def _classify_baseline(self, text: str) -> list[dict]:
+        if self.model is None:
+            return []
+
+        probs = self.model.predict_proba([text])[0]
+        results: list[dict] = []
+
+        for label_id, clause_name in self.id_to_clause.items():
+            prob = float(probs[label_id])
+            threshold = float(self.thresholds.get(clause_name, 0.5))
+            if prob < threshold:
+                continue
+
+            results.append({
+                "clause": clause_name,
+                "confidence": round(prob, 3),
+                "risk": RISK_LEVELS.get(clause_name, "LOW"),
+                "category": _get_category(clause_name),
+                "snippet": _find_snippet(text, clause_name) or _find_snippet_by_terms(text, clause_name),
+                "detected": True,
+            })
+
+        results.sort(key=lambda x: x["confidence"], reverse=True)
+        return results
+
+    def _classify_heuristic_mode(self, text: str) -> list[dict]:
+        return _classify_heuristic(text)
+
+    def _classify(self, text: str) -> list[dict]:
+        if self.mode == "model":
+            return self._classify_model(text)
+        if self.mode == "baseline":
+            return self._classify_baseline(text)
+        return self._classify_heuristic_mode(text)
 
     def _load_checkpoint(self, path: str) -> None:
         try:
             import torch
             from training import ModelArtifacts  # noqa: F401 — needed for unpickling
 
-            device = torch.device(
-                "cuda" if torch.cuda.is_available()
-                else "mps" if torch.backends.mps.is_available()
-                else "cpu"
-            )
+            device = _resolve_torch_device(torch)
             art = torch.load(path, map_location=device, weights_only=False)
             if hasattr(art.model, "to"):
                 art.model = art.model.to(device)
@@ -583,6 +679,7 @@ class LegalClauseClassifier:
                     logger.info("Loaded per-clause thresholds from s4_outputs.pkl.")
 
             logger.info("Loaded Legal-BERT checkpoint from %s.", path)
+            logger.info("Classifier device: %s", device)
 
         except Exception as exc:
             raise RuntimeError(f"Checkpoint load failed: {exc}") from exc
@@ -734,10 +831,7 @@ class LegalClauseClassifier:
         return results
 
     def classify(self, text: str) -> dict:
-        if self.mode == "model":
-            clauses = self._classify_model(text)
-        else:
-            clauses = _classify_heuristic(text)
+        clauses = self._classify(text)
         high   = sum(1 for c in clauses if c["risk"] == "HIGH")
         medium = sum(1 for c in clauses if c["risk"] == "MEDIUM")
         low    = sum(1 for c in clauses if c["risk"] == "LOW")

@@ -18,6 +18,9 @@ venv/
 
 # Secrets (Streamlit app retired, left for safety if .streamlit/ ever returns)
 .streamlit/secrets.toml
+.env
+.env.local
+dashboard_server.log
 
 # Large / generated artifacts
 checkpoints/

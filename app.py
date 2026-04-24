@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -10,10 +11,18 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 from classifier import LegalClauseClassifier
+from llm_summary import build_contract_summary, is_summary_enabled
+
+_LOG_PATH = Path(__file__).with_name("dashboard_server.log")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(_LOG_PATH, encoding="utf-8"),
+    ],
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
@@ -21,6 +30,25 @@ app = Flask(__name__, static_folder="static")
 CORS(app)
 
 _classifier: LegalClauseClassifier | None = None
+
+
+def _rss_mb() -> float | None:
+    try:
+        import resource
+    except ImportError:
+        return None
+
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return round(usage / (1024 * 1024), 1)
+    return round(usage / 1024, 1)
+
+
+def _log_memory_snapshot(context: str) -> None:
+    rss = _rss_mb()
+    if rss is None:
+        return
+    logger.info("%s | rss=%.1f MB", context, rss)
 
 
 def get_classifier() -> LegalClauseClassifier:
@@ -76,7 +104,11 @@ def index():
 @app.route("/api/status")
 def status():
     clf = get_classifier()
-    return jsonify({"mode": clf.mode, "status": "ready"})
+    return jsonify({
+        "mode": clf.mode,
+        "status": "ready",
+        "llm_summary_enabled": is_summary_enabled(),
+    })
 
 
 @app.route("/api/classify", methods=["POST"])
@@ -91,6 +123,13 @@ def classify():
     ext = Path(file.filename).suffix.lower()
     if ext not in (".pdf", ".docx", ".doc", ".txt"):
         return jsonify({"error": f"Unsupported format '{ext}'. Upload PDF, DOCX, or TXT."}), 400
+
+    logger.info(
+        "Classification request received | file=%s | request_bytes=%s",
+        file.filename,
+        request.content_length or "unknown",
+    )
+    _log_memory_snapshot("Before extraction")
 
     tmp_path = None
     try:
@@ -108,20 +147,67 @@ def classify():
     if not text.strip():
         return jsonify({"error": "No readable text found in this file."}), 400
 
+    logger.info(
+        "Text extracted | file=%s | chars=%d | words=%d",
+        file.filename,
+        len(text),
+        len(text.split()),
+    )
+    _log_memory_snapshot("After extraction")
+
     try:
         result = get_classifier().classify(text)
     except Exception as exc:
         logger.exception("Classification error")
         return jsonify({"error": f"Classification failed: {exc}"}), 500
 
+    _log_memory_snapshot("After clause classification")
+    result["llm_summary"] = build_contract_summary(text)
+    logger.info(
+        "AI summary status | available=%s | status=%s",
+        result["llm_summary"].get("available"),
+        result["llm_summary"].get("status"),
+    )
+    _log_memory_snapshot("After AI summary")
     result["word_count"] = len(text.split())
     result["char_count"] = len(text)
     return jsonify(result)
 
 
-if __name__ == "__main__":
+def serve_app() -> None:
+    """Run the dashboard with a production-style local server when available."""
+    logger.info("Server log file: %s", _LOG_PATH)
     logger.info("Initializing Legal-BERT classifier...")
     get_classifier()
     clf = get_classifier()
     logger.info("Mode: %s | Server: http://127.0.0.1:5001", clf.mode)
-    app.run(host="127.0.0.1", port=5001, debug=False)
+
+    try:
+        from waitress import serve
+    except ImportError:
+        logger.warning(
+            "waitress is not installed; falling back to Flask's development server."
+        )
+        app.run(
+            host="127.0.0.1",
+            port=5001,
+            debug=False,
+            use_reloader=False,
+            threaded=True,
+        )
+        return
+
+    logger.info("Serving dashboard with Waitress.")
+    serve(
+        app,
+        host="127.0.0.1",
+        port=5001,
+        threads=8,
+        connection_limit=100,
+        channel_timeout=120,
+        cleanup_interval=30,
+    )
+
+
+if __name__ == "__main__":
+    serve_app()
