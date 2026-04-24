@@ -541,10 +541,14 @@ class LegalClauseClassifier:
         if checkpoint_path is None:
             checkpoint_path = str(Path(__file__).parent / "models" / "Legal-BERT_(CUAD).pt")
 
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"Model checkpoint not found: {checkpoint_path}")
-
-        self._load_checkpoint(checkpoint_path)
+        if os.path.exists(checkpoint_path):
+            self._load_checkpoint(checkpoint_path)
+        else:
+            # Stay in heuristic mode — regex fallback handles classification.
+            logger.warning(
+                "Model checkpoint not found at %s — running in heuristic (regex) mode.",
+                checkpoint_path,
+            )
 
     def _load_checkpoint(self, path: str) -> None:
         try:
@@ -730,7 +734,10 @@ class LegalClauseClassifier:
         return results
 
     def classify(self, text: str) -> dict:
-        clauses = self._classify_model(text)
+        if self.mode == "model":
+            clauses = self._classify_model(text)
+        else:
+            clauses = _classify_heuristic(text)
         high   = sum(1 for c in clauses if c["risk"] == "HIGH")
         medium = sum(1 for c in clauses if c["risk"] == "MEDIUM")
         low    = sum(1 for c in clauses if c["risk"] == "LOW")
