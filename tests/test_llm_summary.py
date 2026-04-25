@@ -35,7 +35,7 @@ def test_build_contract_summary_formats_successful_result(monkeypatch):
     monkeypatch.setattr(
         llm_summary,
         "classify_document_type",
-        lambda text: "Software License Agreement",
+        lambda text: ("Software License Agreement", "gpt-4o"),
     )
     monkeypatch.setattr(
         llm_summary,
@@ -43,7 +43,8 @@ def test_build_contract_summary_formats_successful_result(monkeypatch):
         lambda text, doc_type: (
             "- Parties: Alpha licenses software to Beta.\n"
             "- Payment: Beta pays annually.\n"
-            "- Termination: Either side can terminate for breach."
+            "- Termination: Either side can terminate for breach.",
+            "gpt-4o",
         ),
     )
 
@@ -57,3 +58,44 @@ def test_build_contract_summary_formats_successful_result(monkeypatch):
         "Payment: Beta pays annually.",
         "Termination: Either side can terminate for breach.",
     ]
+
+
+def test_parse_direct_summary_output_extracts_doc_type_and_bullets():
+    doc_type, bullets = llm_summary.parse_direct_summary_output(
+        "Document Type: Software License Agreement\n"
+        "- Parties: Alpha licenses software to Beta.\n"
+        "- Termination: Either side can terminate for breach."
+    )
+
+    assert doc_type == "Software License Agreement"
+    assert bullets == [
+        "Parties: Alpha licenses software to Beta.",
+        "Termination: Either side can terminate for breach.",
+    ]
+
+
+def test_build_contract_summary_uses_direct_fallback_when_two_step_fails(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(llm_summary, "_has_openai_package", lambda: True)
+    monkeypatch.setattr(
+        llm_summary,
+        "classify_document_type",
+        lambda text: (_ for _ in ()).throw(RuntimeError("invalid model ID")),
+    )
+    monkeypatch.setattr(
+        llm_summary,
+        "summarize_contract_direct",
+        lambda text: (
+            "Document Type: Non-Disclosure Agreement\n"
+            "- Parties: Company shares confidential information with Vendor.\n"
+            "- Use: Vendor may only use the information for the project.",
+            "gpt-4o-mini",
+        ),
+    )
+
+    payload = llm_summary.build_contract_summary("Sample contract text")
+
+    assert payload["status"] == "ready"
+    assert payload["doc_type"] == "Non-Disclosure Agreement"
+    assert payload["model"] == "gpt-4o-mini"
+    assert payload["available"] is True

@@ -10,8 +10,16 @@ from pathlib import Path
 from flask import Flask, Response, jsonify, request, send_from_directory
 from flask_cors import CORS
 
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 from classifier import LegalClauseClassifier
+from config import get_review_config
 from llm_summary import build_contract_summary, is_summary_enabled
+from review_pipeline import review_contract_predictions
 
 _LOG_PATH = Path(__file__).with_name("dashboard_server.log")
 
@@ -104,10 +112,12 @@ def index():
 @app.route("/api/status")
 def status():
     clf = get_classifier()
+    review_config = get_review_config()
     return jsonify({
         "mode": clf.mode,
         "status": "ready",
         "llm_summary_enabled": is_summary_enabled(),
+        "second_stage_review_enabled": review_config.enable_second_stage_review,
     })
 
 
@@ -162,6 +172,26 @@ def classify():
         return jsonify({"error": f"Classification failed: {exc}"}), 500
 
     _log_memory_snapshot("After clause classification")
+    try:
+        result["second_stage_review"] = review_contract_predictions(
+            text,
+            get_classifier(),
+            classification_result=result,
+        )
+    except Exception:
+        logger.exception("Second-stage review error")
+        result["second_stage_review"] = {
+            "review_status": "ERROR",
+            "items": [],
+            "decision_counts": {
+                "ACCEPT": 0,
+                "REJECT": 0,
+                "RERANK_LABEL": 0,
+                "HUMAN_REVIEW": 0,
+            },
+        }
+
+    _log_memory_snapshot("After second-stage review")
     result["llm_summary"] = build_contract_summary(text)
     logger.info(
         "AI summary status | available=%s | status=%s",

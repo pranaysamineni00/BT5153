@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import random
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -10,7 +11,13 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForSequenceClassification, get_linear_schedule_with_warmup
 
-from preprocessing import MultiLabelChunkDataset, compute_pos_weight, compute_sample_weights
+from evaluation import (
+    build_contract_level_arrays,
+    compute_aggregate_metrics,
+    fit_temperature_scaler,
+    tune_per_clause_thresholds,
+)
+from preprocessing import MultiLabelChunkDataset, compute_pos_weight
 
 
 def _tfidf_proba_col(est, X):
@@ -51,6 +58,11 @@ class ModelArtifacts:
     id_to_clause: dict[int, str]
     val_logits: np.ndarray
     val_labels: np.ndarray
+    per_clause_thresholds: dict[str, float] = field(default_factory=dict)
+    calibration_temperature: float = 1.0
+    val_contract_metrics: dict[str, float] = field(default_factory=dict)
+    val_chunk_metrics: dict[str, float] = field(default_factory=dict)
+    random_seed: int | None = None
 
 
 def choose_device() -> torch.device:
@@ -64,6 +76,116 @@ def choose_device() -> torch.device:
 
 def _sigmoid(logits: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(logits, -500, 500)))
+
+
+def set_global_seed(seed: int) -> None:
+    """Make training and loader shuffling reproducible."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
+
+
+def _seed_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+def _make_data_loader(
+    dataset: Any,
+    batch_size: int,
+    shuffle: bool,
+    device: torch.device,
+    seed: int,
+) -> DataLoader:
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    use_workers = device.type == "cuda"
+    num_workers = 2 if use_workers else 0
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=use_workers,
+        persistent_workers=use_workers,
+        worker_init_fn=_seed_worker if use_workers else None,
+        generator=generator,
+    )
+
+
+def _summarize_validation_run(
+    val_logits: np.ndarray,
+    val_labels: np.ndarray,
+    id_to_clause: dict[int, str],
+    chunk_examples: list[dict] | None = None,
+) -> dict[str, Any]:
+    """Calibrate scores and derive deployment-facing thresholds/metrics."""
+    calibration_temperature = fit_temperature_scaler(
+        val_logits,
+        val_labels,
+        chunk_examples=chunk_examples,
+    )
+
+    if chunk_examples is None:
+        calibrated_logits = val_logits / calibration_temperature
+        per_clause_thresholds = tune_per_clause_thresholds(
+            calibrated_logits,
+            val_labels,
+            id_to_clause,
+        )
+        best_t, _ = _tune_global_threshold(calibrated_logits, val_labels)
+        contract_metrics = compute_aggregate_metrics(
+            calibrated_logits,
+            val_labels,
+            per_clause_thresholds,
+            id_to_clause,
+        )
+        chunk_metrics = dict(contract_metrics)
+    else:
+        calibrated_chunk_logits = val_logits / calibration_temperature
+        contract_logits, contract_labels, _ = build_contract_level_arrays(
+            val_logits,
+            val_labels,
+            chunk_examples,
+            temperature=calibration_temperature,
+        )
+        per_clause_thresholds = tune_per_clause_thresholds(
+            contract_logits,
+            contract_labels,
+            id_to_clause,
+        )
+        best_t, _ = _tune_global_threshold(contract_logits, contract_labels)
+        contract_metrics = compute_aggregate_metrics(
+            contract_logits,
+            contract_labels,
+            per_clause_thresholds,
+            id_to_clause,
+        )
+        chunk_metrics = compute_aggregate_metrics(
+            calibrated_chunk_logits,
+            val_labels,
+            per_clause_thresholds,
+            id_to_clause,
+        )
+
+    return {
+        "best_threshold": best_t,
+        "per_clause_thresholds": per_clause_thresholds,
+        "calibration_temperature": calibration_temperature,
+        "val_metrics": contract_metrics,
+        "val_contract_metrics": contract_metrics,
+        "val_chunk_metrics": chunk_metrics,
+    }
 
 
 def _tune_global_threshold(
@@ -136,7 +258,6 @@ def _run_training_loop(
     scheduler = get_linear_schedule_with_warmup(optimizer, int(total_steps * warmup_ratio), total_steps)
 
     pos_weight = compute_pos_weight(train_examples).to(device)
-    sample_weights = torch.tensor(compute_sample_weights(train_examples), dtype=torch.float32)
     # reduction="none" so we can apply per-sample weights manually
     loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight, reduction="none")
 
@@ -157,21 +278,23 @@ def _run_training_loop(
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss, seen = 0.0, 0
-        sample_offset = 0  # tracks position in sample_weights across batches
 
         for bi, batch in enumerate(train_loader):
             if max_train_batches is not None and bi >= max_train_batches:
                 break
             labels = batch["labels"].to(device)
-            inputs = {k: v.to(device) for k, v in batch.items() if k != "labels"}
+            sample_weights = batch["sample_weight"].to(device)
+            inputs = {
+                k: v.to(device)
+                for k, v in batch.items()
+                if k not in {"labels", "sample_weight"}
+            }
             optimizer.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(enabled=use_amp):
                 logits = model(**inputs).logits
                 # per-sample loss weighting: down-weight all-negative chunks
-                batch_size_actual = labels.shape[0]
-                batch_sw = sample_weights[sample_offset:sample_offset + batch_size_actual].to(device)
-                loss = (loss_fn(logits, labels).mean(dim=1) * batch_sw).mean()
+                loss = (loss_fn(logits, labels).mean(dim=1) * sample_weights).mean()
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -179,7 +302,6 @@ def _run_training_loop(
             scheduler.step()
             total_loss += float(loss.item())
             seen += 1
-            sample_offset += batch_size_actual
 
         val_logits, val_labels = collect_logits_and_labels(model, val_loader, device, max_val_batches)
         t, metrics = _tune_global_threshold(val_logits, val_labels)
@@ -203,6 +325,7 @@ def train_tfidf_lr(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     id_to_clause: dict[int, str],
+    seed: int = 42,
 ) -> ModelArtifacts:
     """TF-IDF + multi-output Logistic Regression baseline (contract-level, not chunk-level).
 
@@ -214,6 +337,7 @@ def train_tfidf_lr(
     from sklearn.linear_model import LogisticRegression
     from sklearn.dummy import DummyClassifier
 
+    set_global_seed(seed)
     name_to_id = {v: k for k, v in id_to_clause.items()}
 
     def _build_contract_matrix(df: pd.DataFrame) -> tuple[list[str], np.ndarray]:
@@ -243,7 +367,13 @@ def train_tfidf_lr(
         if len(np.unique(col)) < 2:
             est = DummyClassifier(strategy="most_frequent")
         else:
-            est = LogisticRegression(class_weight="balanced", max_iter=1000, C=1.0, solver="lbfgs")
+            est = LogisticRegression(
+                class_weight="balanced",
+                max_iter=1000,
+                C=1.0,
+                solver="lbfgs",
+                random_state=seed,
+            )
         est.fit(X_train, col)
         estimators.append(est)
 
@@ -253,21 +383,31 @@ def train_tfidf_lr(
     p = np.clip(val_probs, eps, 1 - eps)
     val_logits = np.log(p / (1 - p))
 
-    best_t, val_metrics = _tune_global_threshold(val_logits, val_labels)
+    summary = _summarize_validation_run(val_logits, val_labels, id_to_clause)
 
     pipeline = _TfIdfPipeline(vectorizer, estimators)
 
-    print(f"TF-IDF + LR → val micro_F1={val_metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+    print(
+        "TF-IDF + LR → "
+        f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+        f"temperature={summary['calibration_temperature']:.2f}, "
+        f"threshold={summary['best_threshold']:.2f}"
+    )
     return ModelArtifacts(
         model_name="TF-IDF + LR",
         model=pipeline,
         tokenizer=None,
-        best_threshold=best_t,
-        val_metrics=val_metrics,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
         history=pd.DataFrame(),
         id_to_clause=id_to_clause,
         val_logits=val_logits,
         val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
     )
 
 
@@ -287,12 +427,14 @@ def train_bert_cuad(
     max_val_batches: int | None = None,
     device: torch.device | None = None,
     artifact_name: str = "BERT (CUAD)",
+    seed: int = 42,
 ) -> ModelArtifacts:
     """Fine-tune a BERT-family model directly on CUAD multi-label chunks.
 
     The artifact_name parameter lets Legal-BERT reuse this function with a
     different name (see train_legal_bert_cuad in Task 11).
     """
+    set_global_seed(seed)
     device = device or choose_device()
 
     label2id = {v: k for k, v in id_to_clause.items()}
@@ -305,11 +447,8 @@ def train_bert_cuad(
         ignore_mismatched_sizes=True,
     ).to(device)
 
-    _pin = device.type == "cuda"
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
-                              num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin)
+    train_loader = _make_data_loader(train_dataset, batch_size, True, device, seed)
+    val_loader = _make_data_loader(val_dataset, batch_size, False, device, seed + 1)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
         model, train_loader, val_loader, train_examples, device,
@@ -317,17 +456,35 @@ def train_bert_cuad(
         max_train_batches, max_val_batches,
     )
 
-    print(f"{artifact_name} → val micro_F1={metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+    summary = _summarize_validation_run(
+        val_logits,
+        val_labels,
+        id_to_clause,
+        chunk_examples=val_dataset.chunk_examples,
+    )
+
+    print(
+        f"{artifact_name} → "
+        f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+        f"chunk micro_F1={summary['val_chunk_metrics']['micro_f1']:.4f}, "
+        f"temperature={summary['calibration_temperature']:.2f}, "
+        f"threshold={summary['best_threshold']:.2f}"
+    )
     return ModelArtifacts(
         model_name=artifact_name,
         model=model,
         tokenizer=tokenizer,
-        best_threshold=best_t,
-        val_metrics=metrics,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
         history=history,
         id_to_clause=id_to_clause,
         val_logits=val_logits,
         val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
     )
 
 
@@ -347,6 +504,7 @@ def train_bert_ledgar_cuad(
     batch_size: int = 8,
     learning_rate: float = 2e-5,
     device: torch.device | None = None,
+    seed: int = 42,
 ) -> ModelArtifacts:
     """Two-phase training: (1) fine-tune on LEDGAR multi-class, (2) transfer to CUAD multi-label.
 
@@ -354,6 +512,7 @@ def train_bert_ledgar_cuad(
     Phase 2 strips the LEDGAR classification head, attaches a new multi-label head,
     and fine-tunes on CUAD using the shared _run_training_loop.
     """
+    set_global_seed(seed)
     device = device or choose_device()
 
     # ── Phase 1: LEDGAR fine-tuning ───────────────────────────────────────────
@@ -374,10 +533,15 @@ def train_bert_ledgar_cuad(
     ledgar_tok.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
 
     from torch.utils.data import DataLoader as TorchDataLoader
-    _pin = device.type == "cuda"
     ledgar_loader = TorchDataLoader(
-        _LedgarDataset(ledgar_tok), batch_size=batch_size, shuffle=True,
-        num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin,
+        _LedgarDataset(ledgar_tok),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=(2 if device.type == "cuda" else 0),
+        pin_memory=device.type == "cuda",
+        persistent_workers=device.type == "cuda",
+        worker_init_fn=_seed_worker if device.type == "cuda" else None,
+        generator=torch.Generator().manual_seed(seed),
     )
     optimizer_p1 = torch.optim.AdamW(ledgar_model.parameters(), lr=learning_rate, weight_decay=0.01)
     ce_loss = torch.nn.CrossEntropyLoss()
@@ -429,10 +593,8 @@ def train_bert_ledgar_cuad(
           f"missing={len(missing)}, unexpected={len(unexpected)}")
     cuad_model = cuad_model.to(device)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
-                              num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin)
+    train_loader = _make_data_loader(train_dataset, batch_size, True, device, seed + 1)
+    val_loader = _make_data_loader(val_dataset, batch_size, False, device, seed + 2)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
         cuad_model, train_loader, val_loader, train_examples, device,
@@ -444,17 +606,35 @@ def train_bert_ledgar_cuad(
         max_val_batches=cuad_max_val_batches,
     )
 
-    print(f"BERT (LEDGAR→CUAD) → val micro_F1={metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+    summary = _summarize_validation_run(
+        val_logits,
+        val_labels,
+        id_to_clause,
+        chunk_examples=val_dataset.chunk_examples,
+    )
+
+    print(
+        "BERT (LEDGAR→CUAD) → "
+        f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+        f"chunk micro_F1={summary['val_chunk_metrics']['micro_f1']:.4f}, "
+        f"temperature={summary['calibration_temperature']:.2f}, "
+        f"threshold={summary['best_threshold']:.2f}"
+    )
     return ModelArtifacts(
         model_name="BERT (LEDGAR→CUAD)",
         model=model,
         tokenizer=tokenizer,
-        best_threshold=best_t,
-        val_metrics=metrics,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
         history=history,
         id_to_clause=id_to_clause,
         val_logits=val_logits,
         val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
     )
 
 
@@ -471,6 +651,7 @@ def train_legal_bert_cuad(
     max_train_batches: int | None = None,
     max_val_batches: int | None = None,
     device: torch.device | None = None,
+    seed: int = 42,
 ) -> ModelArtifacts:
     """Fine-tune Legal-BERT on CUAD (reuses train_bert_cuad with fixed artifact name)."""
     return train_bert_cuad(
@@ -478,7 +659,7 @@ def train_legal_bert_cuad(
         model_name, tokenizer, id_to_clause,
         epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
         max_train_batches=max_train_batches, max_val_batches=max_val_batches,
-        device=device, artifact_name="Legal-BERT (CUAD)",
+        device=device, artifact_name="Legal-BERT (CUAD)", seed=seed,
     )
 
 
@@ -562,8 +743,10 @@ def train_longformer_cuad(
     max_train_batches: int | None = None,
     max_val_batches: int | None = None,
     device: torch.device | None = None,
+    seed: int = 42,
 ) -> ModelArtifacts:
     """Fine-tune Longformer-base-4096 on CUAD multi-label chunks."""
+    set_global_seed(seed)
     device = device or choose_device()
     label2id = {v: k for k, v in id_to_clause.items()}
     model = AutoModelForSequenceClassification.from_pretrained(
@@ -581,11 +764,8 @@ def train_longformer_cuad(
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
 
-    _pin = device.type == "cuda"
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
-                              num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin)
+    train_loader = _make_data_loader(train_dataset, batch_size, True, device, seed)
+    val_loader = _make_data_loader(val_dataset, batch_size, False, device, seed + 1)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
         model, train_loader, val_loader, train_examples, device,
@@ -596,12 +776,32 @@ def train_longformer_cuad(
         max_train_batches=max_train_batches,
         max_val_batches=max_val_batches,
     )
-    print(f"Longformer (CUAD) → val micro_F1={metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+    summary = _summarize_validation_run(
+        val_logits,
+        val_labels,
+        id_to_clause,
+        chunk_examples=val_dataset.chunk_examples,
+    )
+
+    print(
+        "Longformer (CUAD) → "
+        f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+        f"chunk micro_F1={summary['val_chunk_metrics']['micro_f1']:.4f}, "
+        f"temperature={summary['calibration_temperature']:.2f}, "
+        f"threshold={summary['best_threshold']:.2f}"
+    )
     return ModelArtifacts(
         model_name="Longformer (CUAD)",
         model=model, tokenizer=tokenizer,
-        best_threshold=best_t, val_metrics=metrics, history=history,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
+        history=history,
         id_to_clause=id_to_clause, val_logits=val_logits, val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
     )
 
 
@@ -619,8 +819,10 @@ def train_legalbert_longformer_cuad(
     max_train_batches: int | None = None,
     max_val_batches: int | None = None,
     device: torch.device | None = None,
+    seed: int = 42,
 ) -> ModelArtifacts:
     """Legal-BERT warm-started Longformer fine-tuned on CUAD (Mamakas et al. 2022)."""
+    set_global_seed(seed)
     device = device or choose_device()
     model = init_longformer_from_legal_bert(
         num_labels=len(id_to_clause),
@@ -633,11 +835,8 @@ def train_legalbert_longformer_cuad(
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
 
-    _pin = device.type == "cuda"
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
-                              num_workers=(2 if _pin else 0), pin_memory=_pin, persistent_workers=_pin)
+    train_loader = _make_data_loader(train_dataset, batch_size, True, device, seed)
+    val_loader = _make_data_loader(val_dataset, batch_size, False, device, seed + 1)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
         model, train_loader, val_loader, train_examples, device,
@@ -648,12 +847,32 @@ def train_legalbert_longformer_cuad(
         max_train_batches=max_train_batches,
         max_val_batches=max_val_batches,
     )
-    print(f"Legal-BERT→Longformer → val micro_F1={metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+    summary = _summarize_validation_run(
+        val_logits,
+        val_labels,
+        id_to_clause,
+        chunk_examples=val_dataset.chunk_examples,
+    )
+
+    print(
+        "Legal-BERT→Longformer → "
+        f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+        f"chunk micro_F1={summary['val_chunk_metrics']['micro_f1']:.4f}, "
+        f"temperature={summary['calibration_temperature']:.2f}, "
+        f"threshold={summary['best_threshold']:.2f}"
+    )
     return ModelArtifacts(
         model_name="Legal-BERT→Longformer (CUAD)",
         model=model, tokenizer=tokenizer,
-        best_threshold=best_t, val_metrics=metrics, history=history,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
+        history=history,
         id_to_clause=id_to_clause, val_logits=val_logits, val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
     )
 
 
@@ -675,6 +894,7 @@ def train_longformer_ledgar_cuad(
     batch_size: int = 4,
     learning_rate: float = 2e-5,
     device: torch.device | None = None,
+    seed: int = 42,
 ) -> ModelArtifacts:
     """Two-phase training: (1) fine-tune Longformer-base on LEDGAR, (2) transfer to CUAD.
 
@@ -686,6 +906,7 @@ def train_longformer_ledgar_cuad(
     """
     from torch.utils.data import Dataset as TorchDataset, DataLoader as TorchDataLoader
 
+    set_global_seed(seed)
     device = device or choose_device()
     _pin = device.type == "cuda"
 
@@ -727,7 +948,11 @@ def train_longformer_ledgar_cuad(
     # Phase 1 uses 512-token sequences so a much larger batch is safe on H100.
     ledgar_loader = TorchDataLoader(
         _LFLedgarDataset(ledgar_tok), batch_size=ledgar_batch_size, shuffle=True,
-        num_workers=2, pin_memory=_pin, persistent_workers=True,
+        num_workers=2,
+        pin_memory=_pin,
+        persistent_workers=True,
+        worker_init_fn=_seed_worker,
+        generator=torch.Generator().manual_seed(seed),
     )
     optimizer_p1 = torch.optim.AdamW(ledgar_model.parameters(), lr=learning_rate, weight_decay=0.01)
     ce_loss = torch.nn.CrossEntropyLoss()
@@ -779,13 +1004,15 @@ def train_longformer_ledgar_cuad(
     cuad_model.config.use_cache = False
     cuad_model.gradient_checkpointing_enable()
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+    train_loader = _make_data_loader(train_dataset, batch_size, True, device, seed + 1)
+    val_loader = _make_data_loader(val_dataset, batch_size, False, device, seed + 2)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
-        cuad_model, train_loader, val_loader, train_examples, val_examples or [], device,
+        cuad_model,
+        train_loader,
+        val_loader,
+        train_examples,
+        device,
         epochs=cuad_epochs,
         learning_rate=learning_rate,
         weight_decay=0.01,
@@ -793,12 +1020,33 @@ def train_longformer_ledgar_cuad(
         max_train_batches=cuad_max_train_batches,
         max_val_batches=cuad_max_val_batches,
     )
-    print(f"Longformer (LEDGAR→CUAD) → val micro_F1={metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+
+    summary = _summarize_validation_run(
+        val_logits,
+        val_labels,
+        id_to_clause,
+        chunk_examples=val_examples or val_dataset.chunk_examples,
+    )
+
+    print(
+        "Longformer (LEDGAR→CUAD) → "
+        f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+        f"chunk micro_F1={summary['val_chunk_metrics']['micro_f1']:.4f}, "
+        f"temperature={summary['calibration_temperature']:.2f}, "
+        f"threshold={summary['best_threshold']:.2f}"
+    )
     return ModelArtifacts(
         model_name="Longformer (LEDGAR→CUAD)",
         model=model, tokenizer=tokenizer,
-        best_threshold=best_t, val_metrics=metrics, history=history,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
+        history=history,
         id_to_clause=id_to_clause, val_logits=val_logits, val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
     )
 
 
@@ -859,6 +1107,7 @@ def train_tfidf_lr_v2(
     calibrate: bool = False,
     artifact_name: str = "TF-IDF + LR (v2)",
     verbose: bool = True,
+    seed: int = 42,
 ) -> ModelArtifacts:
     """Enhanced TF-IDF + LR: word+char n-grams, per-clause C tuning, optional calibration."""
     from sklearn.feature_extraction.text import TfidfVectorizer
@@ -868,6 +1117,7 @@ def train_tfidf_lr_v2(
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import GridSearchCV
 
+    set_global_seed(seed)
     train_texts, train_labels = _build_contract_matrix(train_df, id_to_clause)
     val_texts,   val_labels   = _build_contract_matrix(val_df,   id_to_clause)
 
@@ -912,7 +1162,12 @@ def train_tfidf_lr_v2(
         # so each of 3 folds has ≥3 samples. Otherwise fall back to C=1.0 (tuned C grid
         # on tiny positive counts is pure noise — that was the V3 regression).
         if tune_C and min_class >= 10:
-            base = LogisticRegression(class_weight="balanced", max_iter=1000, solver="lbfgs")
+            base = LogisticRegression(
+                class_weight="balanced",
+                max_iter=1000,
+                solver="lbfgs",
+                random_state=seed,
+            )
             gs = GridSearchCV(base, {"C": C_grid}, cv=cv_safe, scoring="f1", n_jobs=1)
             gs.fit(X_train, col)
             best_C = float(gs.best_params_["C"])
@@ -920,7 +1175,11 @@ def train_tfidf_lr_v2(
             best_C = 1.0
 
         est = LogisticRegression(
-            class_weight="balanced", max_iter=1000, C=best_C, solver="lbfgs",
+            class_weight="balanced",
+            max_iter=1000,
+            C=best_C,
+            solver="lbfgs",
+            random_state=seed,
         )
 
         if calibrate and cv_safe >= 2:
@@ -936,13 +1195,18 @@ def train_tfidf_lr_v2(
     p = np.clip(val_probs, eps, 1 - eps)
     val_logits = np.log(p / (1 - p))
 
-    best_t, val_metrics = _tune_global_threshold(val_logits, val_labels)
+    summary = _summarize_validation_run(val_logits, val_labels, id_to_clause)
 
     pipeline = _HybridPipeline(vectorizer, estimators)
 
     if verbose:
         chosen_summary = pd.Series([c for c in chosen_Cs if c is not None]).value_counts().to_dict() if tune_C else {1.0: sum(1 for c in chosen_Cs if c is not None)}
-        print(f"{artifact_name} → val micro_F1={val_metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+        print(
+            f"{artifact_name} → "
+            f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+            f"temperature={summary['calibration_temperature']:.2f}, "
+            f"threshold={summary['best_threshold']:.2f}"
+        )
         if tune_C:
             print(f"  per-clause C distribution: {chosen_summary}")
 
@@ -950,12 +1214,17 @@ def train_tfidf_lr_v2(
         model_name=artifact_name,
         model=pipeline,
         tokenizer=None,
-        best_threshold=best_t,
-        val_metrics=val_metrics,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
         history=pd.DataFrame(),
         id_to_clause=id_to_clause,
         val_logits=val_logits,
         val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
     )
 
 
@@ -1009,6 +1278,7 @@ def train_minilm_lr(
     tune_C: bool = True,
     artifact_name: str = "MiniLM + LR",
     verbose: bool = True,
+    seed: int = 42,
 ) -> ModelArtifacts:
     """Encode contracts with MiniLM (CPU-friendly) + per-label LR on 384-dim embeddings."""
     from pathlib import Path
@@ -1016,6 +1286,7 @@ def train_minilm_lr(
     from sklearn.dummy import DummyClassifier
     from sklearn.model_selection import GridSearchCV
 
+    set_global_seed(seed)
     train_texts, train_labels = _build_contract_matrix(train_df, id_to_clause)
     val_texts,   val_labels   = _build_contract_matrix(val_df,   id_to_clause)
 
@@ -1058,14 +1329,23 @@ def train_minilm_lr(
             min_class = min(n_pos, n_neg)
             cv_safe = min(3, min_class)
             if tune_C and min_class >= 10:
-                base = LogisticRegression(class_weight="balanced", max_iter=1000, solver="lbfgs")
+                base = LogisticRegression(
+                    class_weight="balanced",
+                    max_iter=1000,
+                    solver="lbfgs",
+                    random_state=seed,
+                )
                 gs = GridSearchCV(base, {"C": C_grid}, cv=cv_safe, scoring="f1", n_jobs=1)
                 gs.fit(X_train, col)
                 best_C = float(gs.best_params_["C"])
             else:
                 best_C = 1.0
             est = LogisticRegression(
-                class_weight="balanced", max_iter=1000, C=best_C, solver="lbfgs",
+                class_weight="balanced",
+                max_iter=1000,
+                C=best_C,
+                solver="lbfgs",
+                random_state=seed,
             )
             est.fit(X_train, col)
         estimators.append(est)
@@ -1077,21 +1357,31 @@ def train_minilm_lr(
     p = np.clip(val_probs, eps, 1 - eps)
     val_logits = np.log(p / (1 - p))
 
-    best_t, val_metrics = _tune_global_threshold(val_logits, val_labels)
+    summary = _summarize_validation_run(val_logits, val_labels, id_to_clause)
 
     if verbose:
-        print(f"{artifact_name} → val micro_F1={val_metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+        print(
+            f"{artifact_name} → "
+            f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+            f"temperature={summary['calibration_temperature']:.2f}, "
+            f"threshold={summary['best_threshold']:.2f}"
+        )
 
     return ModelArtifacts(
         model_name=artifact_name,
         model=pipeline,
         tokenizer=None,
-        best_threshold=best_t,
-        val_metrics=val_metrics,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
         history=pd.DataFrame(),
         id_to_clause=id_to_clause,
         val_logits=val_logits,
         val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
     )
 
 
@@ -1159,20 +1449,31 @@ def ensemble_artifacts(
         best_t_out, val_metrics = _tune_global_threshold(val_logits, val_labels)
 
     pipeline = _EnsemblePipeline(artifacts_a.model, artifacts_b.model, weight_a=weight_a)
+    summary = _summarize_validation_run(val_logits, val_labels, artifacts_a.id_to_clause)
 
     if verbose:
-        print(f"{artifact_name} → val micro_F1={val_metrics['micro_f1']:.4f}, threshold={best_t_out:.2f}, weight_a={weight_a}")
+        print(
+            f"{artifact_name} → "
+            f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+            f"temperature={summary['calibration_temperature']:.2f}, "
+            f"threshold={summary['best_threshold']:.2f}, "
+            f"weight_a={weight_a}"
+        )
 
     return ModelArtifacts(
         model_name=artifact_name,
         model=pipeline,
         tokenizer=None,
-        best_threshold=best_t_out,
-        val_metrics=val_metrics,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
         history=pd.DataFrame(),
         id_to_clause=artifacts_a.id_to_clause,
         val_logits=val_logits,
         val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
     )
 
 
@@ -1219,6 +1520,7 @@ def train_hybrid_features_lr(
     minilm_scale: float = 1.0,
     artifact_name: str = "V7 — Hybrid features (TF-IDF ⊕ MiniLM)",
     verbose: bool = True,
+    seed: int = 42,
 ) -> ModelArtifacts:
     """Early-fusion: concatenate TF-IDF (word+char) sparse features with dense MiniLM
     embeddings and train per-label LR on the joint matrix.
@@ -1235,6 +1537,7 @@ def train_hybrid_features_lr(
     from sklearn.pipeline import FeatureUnion
     from sklearn.model_selection import GridSearchCV
 
+    set_global_seed(seed)
     train_texts, train_labels = _build_contract_matrix(train_df, id_to_clause)
     val_texts,   val_labels   = _build_contract_matrix(val_df,   id_to_clause)
 
@@ -1303,7 +1606,12 @@ def train_hybrid_features_lr(
         cv_safe = min(3, min_class)
 
         if tune_C and min_class >= 10:
-            base = LogisticRegression(class_weight="balanced", max_iter=1000, solver="lbfgs")
+            base = LogisticRegression(
+                class_weight="balanced",
+                max_iter=1000,
+                solver="lbfgs",
+                random_state=seed,
+            )
             gs = GridSearchCV(base, {"C": C_grid}, cv=cv_safe, scoring="f1", n_jobs=1)
             gs.fit(X_train, col)
             best_C = float(gs.best_params_["C"])
@@ -1311,7 +1619,11 @@ def train_hybrid_features_lr(
             best_C = 1.0
 
         est = LogisticRegression(
-            class_weight="balanced", max_iter=1000, C=best_C, solver="lbfgs",
+            class_weight="balanced",
+            max_iter=1000,
+            C=best_C,
+            solver="lbfgs",
+            random_state=seed,
         )
         est.fit(X_train, col)
         estimators.append(est)
@@ -1322,22 +1634,32 @@ def train_hybrid_features_lr(
     p = np.clip(val_probs, eps, 1 - eps)
     val_logits = np.log(p / (1 - p))
 
-    best_t, val_metrics = _tune_global_threshold(val_logits, val_labels)
+    summary = _summarize_validation_run(val_logits, val_labels, id_to_clause)
 
     # Wire up inference pipeline; emb_pipeline needs estimators=[] (unused) but a live encoder
     pipeline = _HybridFeaturePipeline(vectorizer, emb_pipeline, estimators, minilm_scale=minilm_scale)
 
     if verbose:
-        print(f"{artifact_name} → val micro_F1={val_metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+        print(
+            f"{artifact_name} → "
+            f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+            f"temperature={summary['calibration_temperature']:.2f}, "
+            f"threshold={summary['best_threshold']:.2f}"
+        )
 
     return ModelArtifacts(
         model_name=artifact_name,
         model=pipeline,
         tokenizer=None,
-        best_threshold=best_t,
-        val_metrics=val_metrics,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
         history=pd.DataFrame(),
         id_to_clause=id_to_clause,
         val_logits=val_logits,
         val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
     )

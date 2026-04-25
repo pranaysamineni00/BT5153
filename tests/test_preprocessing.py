@@ -102,6 +102,15 @@ def test_compute_sample_weights_all_negative_gets_low_weight():
     assert weights[2] == pytest.approx(1.0)
 
 
+def test_compute_sample_weights_prefers_explicit_sample_weight():
+    examples = [
+        {"labels": [0.0, 0.0], "sample_weight": 0.25},
+        {"labels": [1.0, 0.0], "sample_weight": 1.5},
+    ]
+    weights = compute_sample_weights(examples)
+    assert weights == pytest.approx([0.25, 1.5])
+
+
 def test_compute_pos_weight_shape_and_values():
     # 4 examples, 2 labels: label 0 has 1 positive, label 1 has 3 positives
     examples = [
@@ -140,3 +149,19 @@ def test_build_chunk_to_contract_map_maps_index_to_title():
     assert mapping[1] == "ContractA"
     assert mapping[2] == "ContractB"
     assert len(mapping) == 3
+
+
+def test_multilabel_chunk_dataset_returns_sample_weight():
+    from preprocessing import MultiLabelChunkDataset
+
+    dataset = MultiLabelChunkDataset([
+        {
+            "input_ids": [1, 2, 3],
+            "attention_mask": [1, 1, 1],
+            "labels": [0.0, 1.0],
+            "sample_weight": 0.4,
+        }
+    ])
+
+    item = dataset[0]
+    assert float(item["sample_weight"]) == pytest.approx(0.4)

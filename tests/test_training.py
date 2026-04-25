@@ -18,6 +18,8 @@ def test_model_artifacts_dataclass_fields():
     )
     assert ma.model_name == "Test"
     assert ma.best_threshold == pytest.approx(0.5)
+    assert ma.per_clause_thresholds == {}
+    assert ma.calibration_temperature == pytest.approx(1.0)
 
 
 def test_train_tfidf_lr_smoke():

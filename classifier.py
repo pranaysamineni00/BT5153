@@ -539,6 +539,7 @@ def _classify_heuristic(text: str) -> list[dict]:
                 "category":   _get_category(clause),
                 "snippet":    _find_snippet(text, clause) or _find_snippet_by_terms(text, clause),
                 "detected":   True,
+                "confidence_source": "heuristic_keyword",
             })
 
     results.sort(key=lambda x: x["confidence"], reverse=True)
@@ -558,6 +559,14 @@ class LegalClauseClassifier:
         self.tokenizer = None
         self.id_to_clause: dict[int, str] = {}
         self.thresholds: dict[str, float] = {}
+        self.validation_logits = None
+        self.validation_labels = None
+        self.calibration_temperature = 1.0
+        self.threshold_source = "heuristic_default"
+        self.reliability_status = "degraded"
+        self.reliability_warning = (
+            "Running without trained model artifacts; results come from heuristic keyword rules."
+        )
         self._device = None
         self._mode_preference = _classifier_mode_preference()
 
@@ -602,24 +611,57 @@ class LegalClauseClassifier:
             model = payload["model"]
             id_to_clause = payload["id_to_clause"]
             best_threshold = float(payload.get("best_threshold", 0.5))
+            per_clause_thresholds = payload.get("per_clause_thresholds") or {}
 
             self.model = model
             self.tokenizer = None
             self.id_to_clause = {int(k): v for k, v in id_to_clause.items()}
-            self.thresholds = {clause: best_threshold for clause in self.id_to_clause.values()}
+            if per_clause_thresholds:
+                self.thresholds = self._normalize_thresholds(per_clause_thresholds)
+                self.threshold_source = "artifact_per_clause"
+            else:
+                self.thresholds = {clause: best_threshold for clause in self.id_to_clause.values()}
+                self.threshold_source = "artifact_global"
+            self.calibration_temperature = float(payload.get("calibration_temperature", 1.0))
+            self.reliability_status = "ready"
+            self.reliability_warning = ""
             self._device = None
             self.mode = "baseline"
+            self.validation_logits = np.asarray(payload.get("val_logits")) if payload.get("val_logits") is not None else None
+            self.validation_labels = np.asarray(payload.get("val_labels")) if payload.get("val_labels") is not None else None
 
             logger.info("Loaded TF-IDF + LR baseline from %s.", path)
-            logger.info("Baseline threshold: %.3f", best_threshold)
+            logger.info("Baseline threshold source: %s", self.threshold_source)
+            logger.info("Baseline temperature: %.3f", self.calibration_temperature)
         except Exception as exc:
             raise RuntimeError(f"TF-IDF baseline load failed: {exc}") from exc
+
+    def _logits_to_probs(self, logits: np.ndarray) -> np.ndarray:
+        scaled = logits / max(float(self.calibration_temperature), 1e-7)
+        return 1.0 / (1.0 + np.exp(-np.clip(scaled, -500, 500)))
+
+    def _normalize_thresholds(self, raw_thresholds: dict) -> dict[str, float]:
+        normalized: dict[str, float] = {}
+        for key, value in raw_thresholds.items():
+            clause_name = str(key)
+            if isinstance(key, int) and key in self.id_to_clause:
+                clause_name = self.id_to_clause[key]
+            elif isinstance(key, str) and key.isdigit():
+                clause_id = int(key)
+                clause_name = self.id_to_clause.get(clause_id, clause_name)
+            normalized[clause_name] = float(value)
+        return normalized
+
+    def _calibrate_probabilities(self, probs: np.ndarray) -> np.ndarray:
+        clipped = np.clip(probs, 1e-7, 1.0 - 1e-7)
+        logits = np.log(clipped / (1.0 - clipped))
+        return self._logits_to_probs(logits)
 
     def _classify_baseline(self, text: str) -> list[dict]:
         if self.model is None:
             return []
 
-        probs = self.model.predict_proba([text])[0]
+        probs = self._score_baseline_probs(text)
         results: list[dict] = []
 
         for label_id, clause_name in self.id_to_clause.items():
@@ -635,6 +677,7 @@ class LegalClauseClassifier:
                 "category": _get_category(clause_name),
                 "snippet": _find_snippet(text, clause_name) or _find_snippet_by_terms(text, clause_name),
                 "detected": True,
+                "confidence_source": "calibrated_baseline",
             })
 
         results.sort(key=lambda x: x["confidence"], reverse=True)
@@ -664,25 +707,130 @@ class LegalClauseClassifier:
             self.model = art.model
             self.tokenizer = art.tokenizer
             self.id_to_clause = art.id_to_clause
-            self.thresholds = {v: 0.5 for v in art.id_to_clause.values()}
+            self.validation_logits = getattr(art, "val_logits", None)
+            self.validation_labels = getattr(art, "val_labels", None)
+            artifact_thresholds = getattr(art, "per_clause_thresholds", {}) or {}
+            self.calibration_temperature = float(getattr(art, "calibration_temperature", 1.0))
+            if artifact_thresholds:
+                self.thresholds = self._normalize_thresholds(artifact_thresholds)
+                self.threshold_source = "artifact_per_clause"
+            else:
+                fallback_t = float(getattr(art, "best_threshold", 0.5))
+                self.thresholds = {v: fallback_t for v in art.id_to_clause.values()}
+                self.threshold_source = "artifact_global"
             self._device = device
             self.mode = "model"
+            self.reliability_status = "ready"
+            self.reliability_warning = ""
 
             # Load per-clause thresholds from s4_outputs.pkl if present
             s4_path = Path(path).parent.parent / "s4_outputs.pkl"
-            if s4_path.exists():
+            if not artifact_thresholds and s4_path.exists():
                 import pickle
                 with open(s4_path, "rb") as f:
                     s4 = pickle.load(f)
                 if "per_t_best" in s4:
-                    self.thresholds = s4["per_t_best"]
+                    self.thresholds = self._normalize_thresholds(s4["per_t_best"])
+                    self.threshold_source = "legacy_s4_sidecar"
+                    self.reliability_status = "compatibility"
+                    self.reliability_warning = (
+                        "Loaded thresholds from legacy s4_outputs.pkl because the checkpoint "
+                        "artifact did not include per-clause thresholds."
+                    )
                     logger.info("Loaded per-clause thresholds from s4_outputs.pkl.")
 
             logger.info("Loaded Legal-BERT checkpoint from %s.", path)
             logger.info("Classifier device: %s", device)
+            logger.info("Threshold source: %s | temperature=%.3f", self.threshold_source, self.calibration_temperature)
 
         except Exception as exc:
             raise RuntimeError(f"Checkpoint load failed: {exc}") from exc
+
+    def _candidate_label_space(self) -> list[str]:
+        if self.id_to_clause:
+            return [self.id_to_clause[i] for i in sorted(self.id_to_clause)]
+        return list(CUAD_CLAUSES)
+
+    def _score_baseline_probs(self, text: str) -> np.ndarray:
+        if self.model is None:
+            return np.zeros(len(self._candidate_label_space()), dtype=np.float32)
+        return np.asarray(self._calibrate_probabilities(self.model.predict_proba([text])[0]), dtype=np.float32)
+
+    def _score_model_probs(self, text: str) -> np.ndarray:
+        import torch
+
+        if self.model is None or self.tokenizer is None:
+            return np.zeros(len(self._candidate_label_space()), dtype=np.float32)
+
+        enc = self.tokenizer(
+            text,
+            max_length=512,
+            truncation=True,
+            padding=True,
+            return_tensors="pt",
+        )
+        enc = {k: v.to(self._device) for k, v in enc.items()}
+        with torch.no_grad():
+            logits = self.model(**enc).logits.cpu().numpy()[0]
+        return np.asarray(self._logits_to_probs(logits), dtype=np.float32)
+
+    def _score_heuristic_probs(self, text: str) -> np.ndarray:
+        lower = text.lower()
+        scores: list[float] = []
+        for clause in self._candidate_label_space():
+            patterns = _KW.get(clause, [])
+            total_matches = sum(1 for pattern in patterns for _ in re.finditer(pattern, text, re.IGNORECASE))
+            if total_matches > 0:
+                scores.append(min(0.52 + total_matches * 0.07, 0.97))
+                continue
+
+            clause_terms = [term for term in re.split(r"[\s/\-]+", clause.lower()) if len(term) > 2]
+            overlap = sum(1 for term in clause_terms if term in lower)
+            scores.append(min(overlap * 0.12, 0.36))
+
+        return np.asarray(scores, dtype=np.float32)
+
+    def get_top_candidate_labels(
+        self,
+        snippet: str,
+        top_k: int = 3,
+        ensure_labels: list[str] | None = None,
+    ) -> list[dict]:
+        """Return the top 2-3 label candidates for a snippet without altering the main flow."""
+        labels = self._candidate_label_space()
+        if self.mode == "model":
+            probs = self._score_model_probs(snippet)
+        elif self.mode == "baseline":
+            probs = self._score_baseline_probs(snippet)
+        else:
+            probs = self._score_heuristic_probs(snippet)
+
+        scored = [
+            {"label": label, "confidence": round(float(probs[idx]), 3)}
+            for idx, label in enumerate(labels)
+        ]
+        scored.sort(key=lambda item: item["confidence"], reverse=True)
+
+        target_k = max(2, min(max(int(top_k), 1), 3))
+        top = scored[:target_k]
+        existing = {item["label"] for item in top}
+
+        for label in ensure_labels or []:
+            if label in existing or label not in labels:
+                continue
+            idx = labels.index(label)
+            top.append({"label": label, "confidence": round(float(probs[idx]), 3)})
+
+        top.sort(key=lambda item: item["confidence"], reverse=True)
+        deduped: list[dict] = []
+        seen: set[str] = set()
+        for item in top:
+            if item["label"] in seen:
+                continue
+            seen.add(item["label"])
+            deduped.append(item)
+
+        return deduped[: max(target_k, len(ensure_labels or []))]
 
     def _rescore_candidates(self, candidates: list[str], batch_size: int = 8) -> np.ndarray:
         """Run the same fine-tuned model over short candidate spans. Returns
@@ -708,7 +856,7 @@ class LegalClauseClassifier:
             enc = {k: v.to(self._device) for k, v in enc.items()}
             with torch.no_grad():
                 logits = self.model(**enc).logits.cpu().numpy()
-            probs_all[start:start + len(batch)] = 1.0 / (1.0 + np.exp(-np.clip(logits, -500, 500)))
+            probs_all[start:start + len(batch)] = self._logits_to_probs(logits)
         return probs_all
 
     def _classify_model(self, text: str) -> list[dict]:
@@ -758,7 +906,7 @@ class LegalClauseClassifier:
             with torch.no_grad():
                 logits = self.model(**inputs).logits.cpu().numpy()[0]
 
-            window_probs[i] = 1.0 / (1.0 + np.exp(-np.clip(logits, -500, 500)))
+            window_probs[i] = self._logits_to_probs(logits)
 
         max_probs = window_probs.max(axis=0) if n_windows else np.zeros(n_labels, dtype=np.float32)
         best_windows = window_probs.argmax(axis=0) if n_windows else np.zeros(n_labels, dtype=np.int64)
@@ -825,6 +973,7 @@ class LegalClauseClassifier:
                 "category":   _get_category(clause_name),
                 "snippet":    _trim_snippet(snippet),
                 "detected":   True,
+                "confidence_source": "calibrated_model",
             })
 
         results.sort(key=lambda x: x["confidence"], reverse=True)
@@ -837,7 +986,14 @@ class LegalClauseClassifier:
         low    = sum(1 for c in clauses if c["risk"] == "LOW")
         return {
             "mode":         self.mode,
+            "degraded_mode": self.mode == "heuristic",
             "total":        len(clauses),
             "risk_summary": {"HIGH": high, "MEDIUM": medium, "LOW": low},
+            "reliability": {
+                "status": self.reliability_status,
+                "threshold_source": self.threshold_source,
+                "calibration_temperature": round(float(self.calibration_temperature), 3),
+                "warning": self.reliability_warning,
+            },
             "clauses":      clauses,
         }

@@ -35,6 +35,11 @@ joblib.dump(
     {
         "model": artifacts.model,
         "best_threshold": artifacts.best_threshold,
+        "per_clause_thresholds": getattr(artifacts, "per_clause_thresholds", {}),
+        "calibration_temperature": getattr(artifacts, "calibration_temperature", 1.0),
+        "val_contract_metrics": getattr(artifacts, "val_contract_metrics", {}),
+        "val_logits": getattr(artifacts, "val_logits", None),
+        "val_labels": getattr(artifacts, "val_labels", None),
         "id_to_clause": artifacts.id_to_clause,
     },
     out_path,
@@ -43,3 +48,5 @@ joblib.dump(
 print(f"Saved to {out_path}")
 print(f"  Clauses: {len(artifacts.id_to_clause)}")
 print(f"  Threshold: {artifacts.best_threshold:.4f}")
+print(f"  Per-clause thresholds: {len(getattr(artifacts, 'per_clause_thresholds', {}))}")
+print(f"  Temperature: {getattr(artifacts, 'calibration_temperature', 1.0):.3f}")
