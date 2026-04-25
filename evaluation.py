@@ -10,10 +10,111 @@ from sklearn.metrics import (
     recall_score,
 )
 
+_EPS = 1e-7
+
 
 def _sigmoid(logits: np.ndarray) -> np.ndarray:
     """Numerically stable sigmoid."""
     return 1.0 / (1.0 + np.exp(-np.clip(logits, -500, 500)))
+
+
+def _logit(probs: np.ndarray) -> np.ndarray:
+    clipped = np.clip(probs, _EPS, 1.0 - _EPS)
+    return np.log(clipped / (1.0 - clipped))
+
+
+def probabilities_from_logits(
+    logits: np.ndarray,
+    temperature: float = 1.0,
+) -> np.ndarray:
+    """Convert logits to probabilities, optionally with temperature scaling."""
+    safe_temp = max(float(temperature), _EPS)
+    return _sigmoid(logits / safe_temp)
+
+
+def _binary_log_loss(
+    labels: np.ndarray,
+    probs: np.ndarray,
+) -> float:
+    clipped = np.clip(probs, _EPS, 1.0 - _EPS)
+    return float(
+        -np.mean(
+            labels * np.log(clipped)
+            + (1.0 - labels) * np.log(1.0 - clipped)
+        )
+    )
+
+
+def build_contract_level_arrays(
+    logits: np.ndarray,
+    labels: np.ndarray,
+    chunk_examples: list[dict],
+    temperature: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Aggregate chunk-level predictions to contract level via max probability."""
+    if logits.shape[0] != labels.shape[0]:
+        raise ValueError("logits and labels must have the same number of rows")
+    if len(chunk_examples) != logits.shape[0]:
+        raise ValueError("chunk_examples length must match logits rows")
+
+    probs = probabilities_from_logits(logits, temperature=temperature)
+    num_labels = probs.shape[1]
+    prob_cols = [f"prob_{i}" for i in range(num_labels)]
+    label_cols = [f"label_{i}" for i in range(num_labels)]
+
+    frame = pd.DataFrame({"contract_title": [ex["contract_title"] for ex in chunk_examples]})
+    frame[prob_cols] = probs
+    frame[label_cols] = labels
+
+    contract_df = (
+        frame.groupby("contract_title", sort=False)[prob_cols + label_cols]
+        .max()
+        .reset_index()
+    )
+    contract_probs = contract_df[prob_cols].to_numpy(dtype=float)
+    contract_labels = contract_df[label_cols].to_numpy(dtype=float)
+    return _logit(contract_probs), contract_labels, contract_df["contract_title"].tolist()
+
+
+def fit_temperature_scaler(
+    logits: np.ndarray,
+    labels: np.ndarray,
+    chunk_examples: list[dict] | None = None,
+    temperatures: np.ndarray | None = None,
+) -> float:
+    """Grid-search a global temperature that minimises validation log loss."""
+    if temperatures is None:
+        temperatures = np.unique(
+            np.concatenate(
+                [
+                    np.arange(0.5, 1.55, 0.05),
+                    np.arange(1.6, 3.05, 0.1),
+                ]
+            )
+        )
+
+    best_temp = 1.0
+    best_loss = float("inf")
+
+    for temp in temperatures:
+        if chunk_examples is None:
+            eval_probs = probabilities_from_logits(logits, temperature=float(temp))
+            eval_labels = labels
+        else:
+            contract_logits, eval_labels, _ = build_contract_level_arrays(
+                logits,
+                labels,
+                chunk_examples,
+                temperature=float(temp),
+            )
+            eval_probs = _sigmoid(contract_logits)
+
+        loss = _binary_log_loss(eval_labels.astype(float), eval_probs)
+        if loss < best_loss:
+            best_loss = loss
+            best_temp = float(temp)
+
+    return best_temp
 
 
 def precision_at_recall_threshold(
@@ -107,6 +208,31 @@ def compute_aggregate_metrics(
         "micro_precision": float(precision_score(int_labels, preds, average="micro", zero_division=0)),
         "micro_recall":    float(recall_score(int_labels, preds, average="micro",    zero_division=0)),
     }
+
+
+def compute_contract_metrics(
+    logits: np.ndarray,
+    labels: np.ndarray,
+    thresholds: dict[int | str, float],
+    id_to_clause: dict[int, str],
+    chunk_examples: list[dict],
+    temperature: float = 1.0,
+) -> dict[str, float]:
+    """Aggregate chunk predictions by contract, then score with per-clause thresholds."""
+    contract_logits, contract_labels, contract_titles = build_contract_level_arrays(
+        logits,
+        labels,
+        chunk_examples,
+        temperature=temperature,
+    )
+    metrics = compute_aggregate_metrics(
+        contract_logits,
+        contract_labels,
+        thresholds,
+        id_to_clause,
+    )
+    metrics["n_contracts"] = float(len(contract_titles))
+    return metrics
 
 
 def compute_per_clause_metrics(

@@ -83,3 +83,85 @@ def test_per_clause_aupr_zero_when_no_positives():
     df = compute_per_clause_metrics(logits, labels, thresholds, id_to_clause, {0: 0, 1: 20})
     empty_row = df[df["clause_type"] == "Empty"]
     assert float(empty_row["aupr"].iloc[0]) == pytest.approx(0.0)
+
+
+def test_build_contract_level_arrays_max_pools_chunks():
+    from evaluation import build_contract_level_arrays
+
+    logits = np.array([
+        [4.0, -4.0],   # Contract A chunk 1
+        [-2.0, 3.0],   # Contract A chunk 2
+        [-3.0, -3.0],  # Contract B chunk 1
+    ])
+    labels = np.array([
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.0, 0.0],
+    ])
+    chunk_examples = [
+        {"contract_title": "A"},
+        {"contract_title": "A"},
+        {"contract_title": "B"},
+    ]
+
+    contract_logits, contract_labels, contract_titles = build_contract_level_arrays(
+        logits,
+        labels,
+        chunk_examples,
+    )
+
+    assert contract_titles == ["A", "B"]
+    assert contract_labels.shape == (2, 2)
+    assert contract_labels[0].tolist() == [1.0, 1.0]
+    assert contract_logits[0, 0] > 0
+    assert contract_logits[0, 1] > 0
+
+
+def test_fit_temperature_scaler_returns_positive_value():
+    from evaluation import fit_temperature_scaler
+
+    logits = np.array([
+        [2.0, -1.0],
+        [-0.5, 1.5],
+        [1.0, 0.4],
+    ])
+    labels = np.array([
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [1.0, 1.0],
+    ])
+
+    temperature = fit_temperature_scaler(logits, labels)
+    assert temperature > 0.0
+
+
+def test_compute_contract_metrics_reports_contract_count():
+    from evaluation import compute_contract_metrics
+
+    logits = np.array([
+        [3.0, -3.0],
+        [-2.0, 2.0],
+        [-4.0, -4.0],
+    ])
+    labels = np.array([
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.0, 0.0],
+    ])
+    chunk_examples = [
+        {"contract_title": "A"},
+        {"contract_title": "A"},
+        {"contract_title": "B"},
+    ]
+    thresholds = {"AClause": 0.5, "BClause": 0.5}
+    id_to_clause = {0: "AClause", 1: "BClause"}
+
+    metrics = compute_contract_metrics(
+        logits,
+        labels,
+        thresholds,
+        id_to_clause,
+        chunk_examples,
+    )
+
+    assert metrics["n_contracts"] == pytest.approx(2.0)

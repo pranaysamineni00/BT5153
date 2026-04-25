@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import random
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -10,6 +11,12 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import AutoModelForSequenceClassification, get_linear_schedule_with_warmup
 
+from evaluation import (
+    build_contract_level_arrays,
+    compute_aggregate_metrics,
+    fit_temperature_scaler,
+    tune_per_clause_thresholds,
+)
 from preprocessing import MultiLabelChunkDataset, compute_pos_weight
 
 
@@ -51,6 +58,11 @@ class ModelArtifacts:
     id_to_clause: dict[int, str]
     val_logits: np.ndarray
     val_labels: np.ndarray
+    per_clause_thresholds: dict[str, float] = field(default_factory=dict)
+    calibration_temperature: float = 1.0
+    val_contract_metrics: dict[str, float] = field(default_factory=dict)
+    val_chunk_metrics: dict[str, float] = field(default_factory=dict)
+    random_seed: int | None = None
 
 
 def choose_device() -> torch.device:
@@ -66,39 +78,114 @@ def _sigmoid(logits: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(logits, -500, 500)))
 
 
-def _aggregate_to_contract_level(
-    chunk_logits: np.ndarray,
-    chunk_labels: np.ndarray,
-    examples: list[dict],
-) -> tuple[np.ndarray, np.ndarray]:
-    """Max-probability rollup: chunk predictions → one row per contract.
+def set_global_seed(seed: int) -> None:
+    """Make training and loader shuffling reproducible."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
 
-    examples must be aligned with chunk_logits/chunk_labels (same order, val loader
-    must use shuffle=False). For each (contract, clause) pair the maximum sigmoid
-    probability across all chunks is taken; labels are OR-ed (max) across chunks.
-    Returns contract-level logits as log-odds so they are compatible with _sigmoid.
-    """
-    seen: dict[str, int] = {}
-    contract_order: list[str] = []
-    for ex in examples:
-        t = ex["contract_title"]
-        if t not in seen:
-            seen[t] = len(contract_order)
-            contract_order.append(t)
 
-    n_contracts = len(contract_order)
-    n_labels = chunk_logits.shape[1]
-    contract_max_probs = np.zeros((n_contracts, n_labels), dtype=np.float32)
-    contract_labels = np.zeros((n_contracts, n_labels), dtype=np.float32)
+def _seed_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
-    chunk_probs = _sigmoid(chunk_logits)
-    for i, ex in enumerate(examples):
-        ci = seen[ex["contract_title"]]
-        contract_max_probs[ci] = np.maximum(contract_max_probs[ci], chunk_probs[i])
-        contract_labels[ci] = np.maximum(contract_labels[ci], chunk_labels[i])
 
-    p = np.clip(contract_max_probs, 1e-7, 1 - 1e-7)
-    return np.log(p / (1 - p)), contract_labels
+def _make_data_loader(
+    dataset: Any,
+    batch_size: int,
+    shuffle: bool,
+    device: torch.device,
+    seed: int,
+) -> DataLoader:
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    use_workers = device.type == "cuda"
+    num_workers = 2 if use_workers else 0
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=use_workers,
+        persistent_workers=use_workers,
+        worker_init_fn=_seed_worker if use_workers else None,
+        generator=generator,
+    )
+
+
+def _summarize_validation_run(
+    val_logits: np.ndarray,
+    val_labels: np.ndarray,
+    id_to_clause: dict[int, str],
+    chunk_examples: list[dict] | None = None,
+) -> dict[str, Any]:
+    """Calibrate scores and derive deployment-facing thresholds/metrics."""
+    calibration_temperature = fit_temperature_scaler(
+        val_logits,
+        val_labels,
+        chunk_examples=chunk_examples,
+    )
+
+    if chunk_examples is None:
+        calibrated_logits = val_logits / calibration_temperature
+        per_clause_thresholds = tune_per_clause_thresholds(
+            calibrated_logits,
+            val_labels,
+            id_to_clause,
+        )
+        best_t, _ = _tune_global_threshold(calibrated_logits, val_labels)
+        contract_metrics = compute_aggregate_metrics(
+            calibrated_logits,
+            val_labels,
+            per_clause_thresholds,
+            id_to_clause,
+        )
+        chunk_metrics = dict(contract_metrics)
+    else:
+        calibrated_chunk_logits = val_logits / calibration_temperature
+        contract_logits, contract_labels, _ = build_contract_level_arrays(
+            val_logits,
+            val_labels,
+            chunk_examples,
+            temperature=calibration_temperature,
+        )
+        per_clause_thresholds = tune_per_clause_thresholds(
+            contract_logits,
+            contract_labels,
+            id_to_clause,
+        )
+        best_t, _ = _tune_global_threshold(contract_logits, contract_labels)
+        contract_metrics = compute_aggregate_metrics(
+            contract_logits,
+            contract_labels,
+            per_clause_thresholds,
+            id_to_clause,
+        )
+        chunk_metrics = compute_aggregate_metrics(
+            calibrated_chunk_logits,
+            val_labels,
+            per_clause_thresholds,
+            id_to_clause,
+        )
+
+    return {
+        "best_threshold": best_t,
+        "per_clause_thresholds": per_clause_thresholds,
+        "calibration_temperature": calibration_temperature,
+        "val_metrics": contract_metrics,
+        "val_contract_metrics": contract_metrics,
+        "val_chunk_metrics": chunk_metrics,
+    }
 
 
 def _tune_global_threshold(
@@ -152,7 +239,6 @@ def _run_training_loop(
     train_loader: DataLoader,
     val_loader: DataLoader,
     train_examples: list[dict],
-    val_examples: list[dict],
     device: torch.device,
     epochs: int = 3,
     learning_rate: float = 2e-5,
@@ -164,8 +250,6 @@ def _run_training_loop(
     """Shared training loop for all transformer models.
 
     Returns (model, history_df, best_threshold, best_val_metrics, best_val_logits, best_val_labels).
-    val_logits and val_labels in the return value are contract-level (max-probability rollup),
-    matching the granularity used in Section 4 test evaluation.
     Applies pos_weight (BCEWithLogitsLoss) and per-sample downweighting for all-negative chunks.
     """
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -182,11 +266,11 @@ def _run_training_loop(
 
     # Mixed precision: ~1.5-2x speedup on CUDA (T4/V100/A100). No-op on CPU/MPS.
     use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     best_state: dict | None = None
     best_t = 0.5
-    best_metrics: dict[str, float] = {"micro_f1": -1.0, "macro_f1": -1.0}
+    best_metrics: dict[str, float] = {"micro_f1": -1.0}
     best_val_logits: np.ndarray | None = None
     best_val_labels: np.ndarray | None = None
     history_rows: list[dict] = []
@@ -199,18 +283,18 @@ def _run_training_loop(
             if max_train_batches is not None and bi >= max_train_batches:
                 break
             labels = batch["labels"].to(device)
-            inputs = {k: v.to(device) for k, v in batch.items() if k != "labels"}
+            sample_weights = batch["sample_weight"].to(device)
+            inputs = {
+                k: v.to(device)
+                for k, v in batch.items()
+                if k not in {"labels", "sample_weight"}
+            }
             optimizer.zero_grad(set_to_none=True)
 
-            with torch.amp.autocast('cuda', enabled=use_amp):
+            with torch.cuda.amp.autocast(enabled=use_amp):
                 logits = model(**inputs).logits
-                # Per-sample down-weighting: all-negative chunks get weight 0.1.
-                # Computed directly from the batch labels so it is correct under shuffle.
-                is_all_negative = (labels == 0).all(dim=1)
-                batch_sw = torch.where(is_all_negative,
-                                       torch.full((labels.shape[0],), 0.1, device=device),
-                                       torch.ones(labels.shape[0], device=device))
-                loss = (loss_fn(logits, labels).mean(dim=1) * batch_sw).mean()
+                # per-sample loss weighting: down-weight all-negative chunks
+                loss = (loss_fn(logits, labels).mean(dim=1) * sample_weights).mean()
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -219,26 +303,12 @@ def _run_training_loop(
             total_loss += float(loss.item())
             seen += 1
 
-        val_chunk_logits, val_chunk_labels = collect_logits_and_labels(model, val_loader, device, max_val_batches)
-        # Roll up to contract level so thresholds are tuned on the same granularity
-        # as Section 4 test evaluation (max-probability rollup per contract).
-        # Slice val_examples to match the collected rows when max_val_batches truncates.
-        val_ex_subset = val_examples[:len(val_chunk_logits)]
-        val_logits, val_labels = _aggregate_to_contract_level(val_chunk_logits, val_chunk_labels, val_ex_subset)
+        val_logits, val_labels = collect_logits_and_labels(model, val_loader, device, max_val_batches)
         t, metrics = _tune_global_threshold(val_logits, val_labels)
-        # Threshold is tuned by micro-F1 (more stable signal), but the best epoch
-        # checkpoint is selected by macro-F1 — the primary reported metric — so
-        # that the saved model is optimal for equal per-clause evaluation.
-        from sklearn.metrics import f1_score as _f1
-        _preds = (_sigmoid(val_logits) >= t).astype(int)
-        metrics["macro_f1"] = float(_f1(val_labels.astype(int), _preds, average="macro", zero_division=0))
         history_rows.append({"epoch": epoch, "train_loss": total_loss / max(1, seen),
                               "val_threshold": t, **metrics})
-        print(f"  Epoch {epoch}/{epochs}: loss={total_loss / max(1, seen):.4f}  "
-              f"val micro_F1={metrics['micro_f1']:.4f}  val macro_F1={metrics['macro_f1']:.4f}",
-              flush=True)
 
-        if metrics["macro_f1"] > best_metrics["macro_f1"]:
+        if metrics["micro_f1"] > best_metrics["micro_f1"]:
             best_metrics = metrics
             best_t = t
             best_state = copy.deepcopy(model.state_dict())
@@ -255,6 +325,7 @@ def train_tfidf_lr(
     train_df: pd.DataFrame,
     val_df: pd.DataFrame,
     id_to_clause: dict[int, str],
+    seed: int = 42,
 ) -> ModelArtifacts:
     """TF-IDF + multi-output Logistic Regression baseline (contract-level, not chunk-level).
 
@@ -266,6 +337,7 @@ def train_tfidf_lr(
     from sklearn.linear_model import LogisticRegression
     from sklearn.dummy import DummyClassifier
 
+    set_global_seed(seed)
     name_to_id = {v: k for k, v in id_to_clause.items()}
 
     def _build_contract_matrix(df: pd.DataFrame) -> tuple[list[str], np.ndarray]:
@@ -295,7 +367,13 @@ def train_tfidf_lr(
         if len(np.unique(col)) < 2:
             est = DummyClassifier(strategy="most_frequent")
         else:
-            est = LogisticRegression(class_weight="balanced", max_iter=1000, C=1.0, solver="lbfgs")
+            est = LogisticRegression(
+                class_weight="balanced",
+                max_iter=1000,
+                C=1.0,
+                solver="lbfgs",
+                random_state=seed,
+            )
         est.fit(X_train, col)
         estimators.append(est)
 
@@ -305,21 +383,31 @@ def train_tfidf_lr(
     p = np.clip(val_probs, eps, 1 - eps)
     val_logits = np.log(p / (1 - p))
 
-    best_t, val_metrics = _tune_global_threshold(val_logits, val_labels)
+    summary = _summarize_validation_run(val_logits, val_labels, id_to_clause)
 
     pipeline = _TfIdfPipeline(vectorizer, estimators)
 
-    print(f"TF-IDF + LR → val micro_F1={val_metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+    print(
+        "TF-IDF + LR → "
+        f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+        f"temperature={summary['calibration_temperature']:.2f}, "
+        f"threshold={summary['best_threshold']:.2f}"
+    )
     return ModelArtifacts(
         model_name="TF-IDF + LR",
         model=pipeline,
         tokenizer=None,
-        best_threshold=best_t,
-        val_metrics=val_metrics,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
         history=pd.DataFrame(),
         id_to_clause=id_to_clause,
         val_logits=val_logits,
         val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
     )
 
 
@@ -330,7 +418,6 @@ def train_bert_cuad(
     model_name: str,
     tokenizer: Any,
     id_to_clause: dict[int, str],
-    val_examples: list[dict] | None = None,
     epochs: int = 3,
     batch_size: int = 8,
     learning_rate: float = 2e-5,
@@ -340,12 +427,14 @@ def train_bert_cuad(
     max_val_batches: int | None = None,
     device: torch.device | None = None,
     artifact_name: str = "BERT (CUAD)",
+    seed: int = 42,
 ) -> ModelArtifacts:
     """Fine-tune a BERT-family model directly on CUAD multi-label chunks.
 
     The artifact_name parameter lets Legal-BERT reuse this function with a
     different name (see train_legal_bert_cuad in Task 11).
     """
+    set_global_seed(seed)
     device = device or choose_device()
 
     label2id = {v: k for k, v in id_to_clause.items()}
@@ -358,29 +447,44 @@ def train_bert_cuad(
         ignore_mismatched_sizes=True,
     ).to(device)
 
-    _pin = device.type == "cuda"
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+    train_loader = _make_data_loader(train_dataset, batch_size, True, device, seed)
+    val_loader = _make_data_loader(val_dataset, batch_size, False, device, seed + 1)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
-        model, train_loader, val_loader, train_examples, val_examples or [], device,
+        model, train_loader, val_loader, train_examples, device,
         epochs, learning_rate, weight_decay, warmup_ratio,
         max_train_batches, max_val_batches,
     )
 
-    print(f"{artifact_name} → val micro_F1={metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+    summary = _summarize_validation_run(
+        val_logits,
+        val_labels,
+        id_to_clause,
+        chunk_examples=val_dataset.chunk_examples,
+    )
+
+    print(
+        f"{artifact_name} → "
+        f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+        f"chunk micro_F1={summary['val_chunk_metrics']['micro_f1']:.4f}, "
+        f"temperature={summary['calibration_temperature']:.2f}, "
+        f"threshold={summary['best_threshold']:.2f}"
+    )
     return ModelArtifacts(
         model_name=artifact_name,
         model=model,
         tokenizer=tokenizer,
-        best_threshold=best_t,
-        val_metrics=metrics,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
         history=history,
         id_to_clause=id_to_clause,
         val_logits=val_logits,
         val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
     )
 
 
@@ -392,7 +496,6 @@ def train_bert_ledgar_cuad(
     model_name: str,
     tokenizer: Any,
     id_to_clause: dict[int, str],
-    val_examples: list[dict] | None = None,
     ledgar_epochs: int = 3,
     ledgar_max_batches: int | None = None,
     cuad_epochs: int = 3,
@@ -401,6 +504,7 @@ def train_bert_ledgar_cuad(
     batch_size: int = 8,
     learning_rate: float = 2e-5,
     device: torch.device | None = None,
+    seed: int = 42,
 ) -> ModelArtifacts:
     """Two-phase training: (1) fine-tune on LEDGAR multi-class, (2) transfer to CUAD multi-label.
 
@@ -408,8 +512,7 @@ def train_bert_ledgar_cuad(
     Phase 2 strips the LEDGAR classification head, attaches a new multi-label head,
     and fine-tunes on CUAD using the shared _run_training_loop.
     """
-    from torch.utils.data import Dataset as TorchDataset, DataLoader as TorchDataLoader
-
+    set_global_seed(seed)
     device = device or choose_device()
 
     # ── Phase 1: LEDGAR fine-tuning ───────────────────────────────────────────
@@ -429,28 +532,21 @@ def train_bert_ledgar_cuad(
     ledgar_tok = ledgar_train.map(_tokenize_ledgar, batched=True)
     ledgar_tok.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
 
-    class _LedgarDataset(TorchDataset):
-        def __init__(self, hf_ds):
-            self.ds = hf_ds
-        def __len__(self):
-            return len(self.ds)
-        def __getitem__(self, i):
-            item = self.ds[i]
-            return {
-                "input_ids":      item["input_ids"],
-                "attention_mask": item["attention_mask"],
-                "labels":         item["label"],
-            }
-
-    _pin = device.type == "cuda"
+    from torch.utils.data import DataLoader as TorchDataLoader
     ledgar_loader = TorchDataLoader(
-        _LedgarDataset(ledgar_tok), batch_size=batch_size, shuffle=True,
-        num_workers=2, pin_memory=_pin, persistent_workers=True,
+        _LedgarDataset(ledgar_tok),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=(2 if device.type == "cuda" else 0),
+        pin_memory=device.type == "cuda",
+        persistent_workers=device.type == "cuda",
+        worker_init_fn=_seed_worker if device.type == "cuda" else None,
+        generator=torch.Generator().manual_seed(seed),
     )
     optimizer_p1 = torch.optim.AdamW(ledgar_model.parameters(), lr=learning_rate, weight_decay=0.01)
     ce_loss = torch.nn.CrossEntropyLoss()
     use_amp = device.type == "cuda"
-    scaler_p1 = torch.amp.GradScaler('cuda', enabled=use_amp)
+    scaler_p1 = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     for epoch in range(1, ledgar_epochs + 1):
         ledgar_model.train()
@@ -461,7 +557,7 @@ def train_bert_ledgar_cuad(
             labels = batch["labels"].to(device)
             inputs = {k: v.to(device) for k, v in batch.items() if k != "labels"}
             optimizer_p1.zero_grad(set_to_none=True)
-            with torch.amp.autocast('cuda', enabled=use_amp):
+            with torch.cuda.amp.autocast(enabled=use_amp):
                 logits = ledgar_model(**inputs).logits
                 loss = ce_loss(logits, labels)
             scaler_p1.scale(loss).backward()
@@ -497,13 +593,11 @@ def train_bert_ledgar_cuad(
           f"missing={len(missing)}, unexpected={len(unexpected)}")
     cuad_model = cuad_model.to(device)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+    train_loader = _make_data_loader(train_dataset, batch_size, True, device, seed + 1)
+    val_loader = _make_data_loader(val_dataset, batch_size, False, device, seed + 2)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
-        cuad_model, train_loader, val_loader, train_examples, val_examples or [], device,
+        cuad_model, train_loader, val_loader, train_examples, device,
         epochs=cuad_epochs,
         learning_rate=learning_rate,
         weight_decay=0.01,
@@ -512,17 +606,35 @@ def train_bert_ledgar_cuad(
         max_val_batches=cuad_max_val_batches,
     )
 
-    print(f"BERT (LEDGAR→CUAD) → val micro_F1={metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+    summary = _summarize_validation_run(
+        val_logits,
+        val_labels,
+        id_to_clause,
+        chunk_examples=val_dataset.chunk_examples,
+    )
+
+    print(
+        "BERT (LEDGAR→CUAD) → "
+        f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+        f"chunk micro_F1={summary['val_chunk_metrics']['micro_f1']:.4f}, "
+        f"temperature={summary['calibration_temperature']:.2f}, "
+        f"threshold={summary['best_threshold']:.2f}"
+    )
     return ModelArtifacts(
         model_name="BERT (LEDGAR→CUAD)",
         model=model,
         tokenizer=tokenizer,
-        best_threshold=best_t,
-        val_metrics=metrics,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
         history=history,
         id_to_clause=id_to_clause,
         val_logits=val_logits,
         val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
     )
 
 
@@ -532,7 +644,6 @@ def train_legal_bert_cuad(
     train_examples: list[dict],
     tokenizer: Any,
     id_to_clause: dict[int, str],
-    val_examples: list[dict] | None = None,
     model_name: str = "nlpaueb/legal-bert-base-uncased",
     epochs: int = 3,
     batch_size: int = 8,
@@ -540,15 +651,15 @@ def train_legal_bert_cuad(
     max_train_batches: int | None = None,
     max_val_batches: int | None = None,
     device: torch.device | None = None,
+    seed: int = 42,
 ) -> ModelArtifacts:
     """Fine-tune Legal-BERT on CUAD (reuses train_bert_cuad with fixed artifact name)."""
     return train_bert_cuad(
         train_dataset, val_dataset, train_examples,
         model_name, tokenizer, id_to_clause,
-        val_examples=val_examples,
         epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
         max_train_batches=max_train_batches, max_val_batches=max_val_batches,
-        device=device, artifact_name="Legal-BERT (CUAD)",
+        device=device, artifact_name="Legal-BERT (CUAD)", seed=seed,
     )
 
 
@@ -625,7 +736,6 @@ def train_longformer_cuad(
     train_examples: list[dict],
     tokenizer: Any,
     id_to_clause: dict[int, str],
-    val_examples: list[dict] | None = None,
     model_name: str = "allenai/longformer-base-4096",
     epochs: int = 3,
     batch_size: int = 4,
@@ -633,8 +743,10 @@ def train_longformer_cuad(
     max_train_batches: int | None = None,
     max_val_batches: int | None = None,
     device: torch.device | None = None,
+    seed: int = 42,
 ) -> ModelArtifacts:
     """Fine-tune Longformer-base-4096 on CUAD multi-label chunks."""
+    set_global_seed(seed)
     device = device or choose_device()
     label2id = {v: k for k, v in id_to_clause.items()}
     model = AutoModelForSequenceClassification.from_pretrained(
@@ -652,14 +764,11 @@ def train_longformer_cuad(
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
 
-    _pin = device.type == "cuda"
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+    train_loader = _make_data_loader(train_dataset, batch_size, True, device, seed)
+    val_loader = _make_data_loader(val_dataset, batch_size, False, device, seed + 1)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
-        model, train_loader, val_loader, train_examples, val_examples or [], device,
+        model, train_loader, val_loader, train_examples, device,
         epochs=epochs,
         learning_rate=learning_rate,
         weight_decay=0.01,
@@ -667,12 +776,32 @@ def train_longformer_cuad(
         max_train_batches=max_train_batches,
         max_val_batches=max_val_batches,
     )
-    print(f"Longformer (CUAD) → val micro_F1={metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+    summary = _summarize_validation_run(
+        val_logits,
+        val_labels,
+        id_to_clause,
+        chunk_examples=val_dataset.chunk_examples,
+    )
+
+    print(
+        "Longformer (CUAD) → "
+        f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+        f"chunk micro_F1={summary['val_chunk_metrics']['micro_f1']:.4f}, "
+        f"temperature={summary['calibration_temperature']:.2f}, "
+        f"threshold={summary['best_threshold']:.2f}"
+    )
     return ModelArtifacts(
         model_name="Longformer (CUAD)",
         model=model, tokenizer=tokenizer,
-        best_threshold=best_t, val_metrics=metrics, history=history,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
+        history=history,
         id_to_clause=id_to_clause, val_logits=val_logits, val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
     )
 
 
@@ -682,7 +811,6 @@ def train_legalbert_longformer_cuad(
     train_examples: list[dict],
     tokenizer: Any,
     id_to_clause: dict[int, str],
-    val_examples: list[dict] | None = None,
     legal_bert_name: str = "nlpaueb/legal-bert-base-uncased",
     longformer_name: str = "allenai/longformer-base-4096",
     epochs: int = 3,
@@ -691,8 +819,10 @@ def train_legalbert_longformer_cuad(
     max_train_batches: int | None = None,
     max_val_batches: int | None = None,
     device: torch.device | None = None,
+    seed: int = 42,
 ) -> ModelArtifacts:
     """Legal-BERT warm-started Longformer fine-tuned on CUAD (Mamakas et al. 2022)."""
+    set_global_seed(seed)
     device = device or choose_device()
     model = init_longformer_from_legal_bert(
         num_labels=len(id_to_clause),
@@ -705,14 +835,11 @@ def train_legalbert_longformer_cuad(
     model.config.use_cache = False
     model.gradient_checkpointing_enable()
 
-    _pin = device.type == "cuda"
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+    train_loader = _make_data_loader(train_dataset, batch_size, True, device, seed)
+    val_loader = _make_data_loader(val_dataset, batch_size, False, device, seed + 1)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
-        model, train_loader, val_loader, train_examples, val_examples or [], device,
+        model, train_loader, val_loader, train_examples, device,
         epochs=epochs,
         learning_rate=learning_rate,
         weight_decay=0.01,
@@ -720,12 +847,32 @@ def train_legalbert_longformer_cuad(
         max_train_batches=max_train_batches,
         max_val_batches=max_val_batches,
     )
-    print(f"Legal-BERT→Longformer → val micro_F1={metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+    summary = _summarize_validation_run(
+        val_logits,
+        val_labels,
+        id_to_clause,
+        chunk_examples=val_dataset.chunk_examples,
+    )
+
+    print(
+        "Legal-BERT→Longformer → "
+        f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+        f"chunk micro_F1={summary['val_chunk_metrics']['micro_f1']:.4f}, "
+        f"temperature={summary['calibration_temperature']:.2f}, "
+        f"threshold={summary['best_threshold']:.2f}"
+    )
     return ModelArtifacts(
         model_name="Legal-BERT→Longformer (CUAD)",
         model=model, tokenizer=tokenizer,
-        best_threshold=best_t, val_metrics=metrics, history=history,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
+        history=history,
         id_to_clause=id_to_clause, val_logits=val_logits, val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
     )
 
 
@@ -747,6 +894,7 @@ def train_longformer_ledgar_cuad(
     batch_size: int = 4,
     learning_rate: float = 2e-5,
     device: torch.device | None = None,
+    seed: int = 42,
 ) -> ModelArtifacts:
     """Two-phase training: (1) fine-tune Longformer-base on LEDGAR, (2) transfer to CUAD.
 
@@ -758,6 +906,7 @@ def train_longformer_ledgar_cuad(
     """
     from torch.utils.data import Dataset as TorchDataset, DataLoader as TorchDataLoader
 
+    set_global_seed(seed)
     device = device or choose_device()
     _pin = device.type == "cuda"
 
@@ -799,7 +948,11 @@ def train_longformer_ledgar_cuad(
     # Phase 1 uses 512-token sequences so a much larger batch is safe on H100.
     ledgar_loader = TorchDataLoader(
         _LFLedgarDataset(ledgar_tok), batch_size=ledgar_batch_size, shuffle=True,
-        num_workers=2, pin_memory=_pin, persistent_workers=True,
+        num_workers=2,
+        pin_memory=_pin,
+        persistent_workers=True,
+        worker_init_fn=_seed_worker,
+        generator=torch.Generator().manual_seed(seed),
     )
     optimizer_p1 = torch.optim.AdamW(ledgar_model.parameters(), lr=learning_rate, weight_decay=0.01)
     ce_loss = torch.nn.CrossEntropyLoss()
@@ -851,13 +1004,15 @@ def train_longformer_ledgar_cuad(
     cuad_model.config.use_cache = False
     cuad_model.gradient_checkpointing_enable()
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
-    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False,
-                              num_workers=2, pin_memory=_pin, persistent_workers=True)
+    train_loader = _make_data_loader(train_dataset, batch_size, True, device, seed + 1)
+    val_loader = _make_data_loader(val_dataset, batch_size, False, device, seed + 2)
 
     model, history, best_t, metrics, val_logits, val_labels = _run_training_loop(
-        cuad_model, train_loader, val_loader, train_examples, val_examples or [], device,
+        cuad_model,
+        train_loader,
+        val_loader,
+        train_examples,
+        device,
         epochs=cuad_epochs,
         learning_rate=learning_rate,
         weight_decay=0.01,
@@ -865,10 +1020,646 @@ def train_longformer_ledgar_cuad(
         max_train_batches=cuad_max_train_batches,
         max_val_batches=cuad_max_val_batches,
     )
-    print(f"Longformer (LEDGAR→CUAD) → val micro_F1={metrics['micro_f1']:.4f}, threshold={best_t:.2f}")
+
+    summary = _summarize_validation_run(
+        val_logits,
+        val_labels,
+        id_to_clause,
+        chunk_examples=val_examples or val_dataset.chunk_examples,
+    )
+
+    print(
+        "Longformer (LEDGAR→CUAD) → "
+        f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+        f"chunk micro_F1={summary['val_chunk_metrics']['micro_f1']:.4f}, "
+        f"temperature={summary['calibration_temperature']:.2f}, "
+        f"threshold={summary['best_threshold']:.2f}"
+    )
     return ModelArtifacts(
         model_name="Longformer (LEDGAR→CUAD)",
         model=model, tokenizer=tokenizer,
-        best_threshold=best_t, val_metrics=metrics, history=history,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
+        history=history,
         id_to_clause=id_to_clause, val_logits=val_logits, val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
+    )
+
+
+class _LedgarDataset(torch.utils.data.Dataset):
+    def __init__(self, hf_ds):
+        self.ds = hf_ds
+    def __len__(self):
+        return len(self.ds)
+    def __getitem__(self, i):
+        item = self.ds[i]
+        return {
+            "input_ids":      item["input_ids"],
+            "attention_mask": item["attention_mask"],
+            "labels":         item["label"],
+        }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Performance-tuning variants — CPU-friendly upgrades over train_tfidf_lr
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+def _build_contract_matrix(df: pd.DataFrame, id_to_clause: dict[int, str]) -> tuple[list[str], np.ndarray]:
+    """Shared helper: one row per contract, full text + multi-label vector."""
+    name_to_id = {v: k for k, v in id_to_clause.items()}
+    texts, label_rows = [], []
+    for _, group in df.groupby("contract_title"):
+        texts.append(group["contract_text"].iloc[0])
+        row = np.zeros(len(id_to_clause), dtype=float)
+        for r in group.itertuples(index=False):
+            if r.has_answer and r.clause_type in name_to_id:
+                row[name_to_id[r.clause_type]] = 1.0
+        label_rows.append(row)
+    return texts, np.array(label_rows)
+
+
+class _HybridPipeline:
+    """Like _TfIdfPipeline but supports a FeatureUnion (word + char TF-IDF)."""
+
+    def __init__(self, vectorizer, estimators):
+        self.vectorizer = vectorizer
+        self.estimators_ = estimators
+
+    def predict_proba(self, texts: list[str]) -> np.ndarray:
+        X = self.vectorizer.transform(texts)
+        return np.column_stack([_tfidf_proba_col(e, X) for e in self.estimators_])
+
+
+def train_tfidf_lr_v2(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    id_to_clause: dict[int, str],
+    ngram_word: tuple[int, int] = (1, 3),
+    ngram_char: tuple[int, int] = (3, 5),
+    max_features_word: int = 100_000,
+    max_features_char: int = 50_000,
+    tune_C: bool = False,
+    calibrate: bool = False,
+    artifact_name: str = "TF-IDF + LR (v2)",
+    verbose: bool = True,
+    seed: int = 42,
+) -> ModelArtifacts:
+    """Enhanced TF-IDF + LR: word+char n-grams, per-clause C tuning, optional calibration."""
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.dummy import DummyClassifier
+    from sklearn.pipeline import FeatureUnion
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.model_selection import GridSearchCV
+
+    set_global_seed(seed)
+    train_texts, train_labels = _build_contract_matrix(train_df, id_to_clause)
+    val_texts,   val_labels   = _build_contract_matrix(val_df,   id_to_clause)
+
+    # Combined word + character n-gram features via FeatureUnion
+    vectorizer = FeatureUnion([
+        ("word", TfidfVectorizer(
+            analyzer="word", ngram_range=ngram_word,
+            max_features=max_features_word, sublinear_tf=True,
+        )),
+        ("char", TfidfVectorizer(
+            analyzer="char_wb", ngram_range=ngram_char,
+            max_features=max_features_char, sublinear_tf=True,
+        )),
+    ])
+    X_train = vectorizer.fit_transform(train_texts)
+    X_val   = vectorizer.transform(val_texts)
+
+    if verbose:
+        print(f"Features: {X_train.shape[1]:,} (word+char)")
+
+    C_grid = [0.1, 1.0, 10.0]
+
+    estimators = []
+    chosen_Cs: list[float | None] = []
+    for i in range(train_labels.shape[1]):
+        col = train_labels[:, i]
+        if len(np.unique(col)) < 2:
+            est = DummyClassifier(strategy="most_frequent")
+            est.fit(X_train, col)
+            estimators.append(est)
+            chosen_Cs.append(None)
+            continue
+
+        # Stratified CV needs ≥ cv samples for BOTH classes (positive AND negative).
+        # Common clauses (e.g. "Parties") appear in nearly every contract → n_neg is tiny.
+        n_pos = int(col.sum())
+        n_neg = int(len(col) - n_pos)
+        min_class = min(n_pos, n_neg)
+        cv_safe = min(3, min_class)   # 3 if both classes have ≥3, else 2, else 0
+
+        # Only per-clause tune when CV is reliable: require ≥10 of the minority class
+        # so each of 3 folds has ≥3 samples. Otherwise fall back to C=1.0 (tuned C grid
+        # on tiny positive counts is pure noise — that was the V3 regression).
+        if tune_C and min_class >= 10:
+            base = LogisticRegression(
+                class_weight="balanced",
+                max_iter=1000,
+                solver="lbfgs",
+                random_state=seed,
+            )
+            gs = GridSearchCV(base, {"C": C_grid}, cv=cv_safe, scoring="f1", n_jobs=1)
+            gs.fit(X_train, col)
+            best_C = float(gs.best_params_["C"])
+        else:
+            best_C = 1.0
+
+        est = LogisticRegression(
+            class_weight="balanced",
+            max_iter=1000,
+            C=best_C,
+            solver="lbfgs",
+            random_state=seed,
+        )
+
+        if calibrate and cv_safe >= 2:
+            est = CalibratedClassifierCV(est, cv=cv_safe, method="sigmoid")
+
+        est.fit(X_train, col)
+        estimators.append(est)
+        chosen_Cs.append(best_C)
+
+    # Collect class-1 probabilities; convert to log-odds for sigmoid-based evaluation
+    eps = 1e-7
+    val_probs = np.column_stack([_tfidf_proba_col(est, X_val) for est in estimators])
+    p = np.clip(val_probs, eps, 1 - eps)
+    val_logits = np.log(p / (1 - p))
+
+    summary = _summarize_validation_run(val_logits, val_labels, id_to_clause)
+
+    pipeline = _HybridPipeline(vectorizer, estimators)
+
+    if verbose:
+        chosen_summary = pd.Series([c for c in chosen_Cs if c is not None]).value_counts().to_dict() if tune_C else {1.0: sum(1 for c in chosen_Cs if c is not None)}
+        print(
+            f"{artifact_name} → "
+            f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+            f"temperature={summary['calibration_temperature']:.2f}, "
+            f"threshold={summary['best_threshold']:.2f}"
+        )
+        if tune_C:
+            print(f"  per-clause C distribution: {chosen_summary}")
+
+    return ModelArtifacts(
+        model_name=artifact_name,
+        model=pipeline,
+        tokenizer=None,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
+        history=pd.DataFrame(),
+        id_to_clause=id_to_clause,
+        val_logits=val_logits,
+        val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
+    )
+
+
+# ─── MiniLM embedding backbone ──────────────────────────────────────────────
+
+
+class _EmbeddingPipeline:
+    """Wraps a sentence-transformer encoder + per-label LR estimators.
+
+    predict_proba(texts) returns class-1 probabilities (n_texts, n_labels).
+    Embedding generation: split on "\\n\\n", encode each passage, mean-pool per contract.
+    """
+
+    def __init__(self, encoder_name: str, estimators: list, embeddings: np.ndarray | None = None):
+        self.encoder_name = encoder_name
+        self.estimators_ = estimators
+        # Encoder is loaded lazily (avoids pickling torch modules into checkpoints)
+        self._encoder = None
+        self._train_embeddings = embeddings
+
+    def _get_encoder(self):
+        if self._encoder is None:
+            from sentence_transformers import SentenceTransformer
+            self._encoder = SentenceTransformer(self.encoder_name)
+        return self._encoder
+
+    def encode_contracts(self, texts: list[str], batch_size: int = 64) -> np.ndarray:
+        encoder = self._get_encoder()
+        vectors = []
+        for text in texts:
+            passages = [p.strip() for p in text.split("\n\n") if p.strip()]
+            if not passages:
+                passages = [text[:2000]]
+            # Clip each passage to stay within MiniLM's 256-token window
+            passages = [p[:1500] for p in passages]
+            emb = encoder.encode(passages, batch_size=batch_size, show_progress_bar=False)
+            vectors.append(emb.mean(axis=0))
+        return np.vstack(vectors)
+
+    def predict_proba(self, texts: list[str]) -> np.ndarray:
+        X = self.encode_contracts(texts)
+        return np.column_stack([_tfidf_proba_col(est, X) for est in self.estimators_])
+
+
+def train_minilm_lr(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    id_to_clause: dict[int, str],
+    encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    cache_path: str | None = "checkpoints/minilm_embeddings.npz",
+    tune_C: bool = True,
+    artifact_name: str = "MiniLM + LR",
+    verbose: bool = True,
+    seed: int = 42,
+) -> ModelArtifacts:
+    """Encode contracts with MiniLM (CPU-friendly) + per-label LR on 384-dim embeddings."""
+    from pathlib import Path
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.dummy import DummyClassifier
+    from sklearn.model_selection import GridSearchCV
+
+    set_global_seed(seed)
+    train_texts, train_labels = _build_contract_matrix(train_df, id_to_clause)
+    val_texts,   val_labels   = _build_contract_matrix(val_df,   id_to_clause)
+
+    pipeline = _EmbeddingPipeline(encoder_name, estimators=[])
+
+    cache_ok = False
+    if cache_path and Path(cache_path).exists():
+        try:
+            cached = np.load(cache_path)
+            X_train = cached["train"]
+            X_val   = cached["val"]
+            if X_train.shape[0] == len(train_texts) and X_val.shape[0] == len(val_texts):
+                cache_ok = True
+                if verbose:
+                    print(f"Loaded cached MiniLM embeddings from {cache_path}")
+        except Exception:
+            cache_ok = False
+
+    if not cache_ok:
+        if verbose:
+            print(f"Encoding {len(train_texts) + len(val_texts)} contracts with {encoder_name}…")
+        X_train = pipeline.encode_contracts(train_texts)
+        X_val   = pipeline.encode_contracts(val_texts)
+        if cache_path:
+            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+            np.savez(cache_path, train=X_train, val=X_val)
+            if verbose:
+                print(f"Cached embeddings → {cache_path}")
+
+    C_grid = [0.1, 1.0, 10.0]
+    estimators = []
+    for i in range(train_labels.shape[1]):
+        col = train_labels[:, i]
+        if len(np.unique(col)) < 2:
+            est = DummyClassifier(strategy="most_frequent")
+            est.fit(X_train, col)
+        else:
+            n_pos = int(col.sum())
+            n_neg = int(len(col) - n_pos)
+            min_class = min(n_pos, n_neg)
+            cv_safe = min(3, min_class)
+            if tune_C and min_class >= 10:
+                base = LogisticRegression(
+                    class_weight="balanced",
+                    max_iter=1000,
+                    solver="lbfgs",
+                    random_state=seed,
+                )
+                gs = GridSearchCV(base, {"C": C_grid}, cv=cv_safe, scoring="f1", n_jobs=1)
+                gs.fit(X_train, col)
+                best_C = float(gs.best_params_["C"])
+            else:
+                best_C = 1.0
+            est = LogisticRegression(
+                class_weight="balanced",
+                max_iter=1000,
+                C=best_C,
+                solver="lbfgs",
+                random_state=seed,
+            )
+            est.fit(X_train, col)
+        estimators.append(est)
+
+    pipeline.estimators_ = estimators
+
+    eps = 1e-7
+    val_probs = np.column_stack([_tfidf_proba_col(est, X_val) for est in estimators])
+    p = np.clip(val_probs, eps, 1 - eps)
+    val_logits = np.log(p / (1 - p))
+
+    summary = _summarize_validation_run(val_logits, val_labels, id_to_clause)
+
+    if verbose:
+        print(
+            f"{artifact_name} → "
+            f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+            f"temperature={summary['calibration_temperature']:.2f}, "
+            f"threshold={summary['best_threshold']:.2f}"
+        )
+
+    return ModelArtifacts(
+        model_name=artifact_name,
+        model=pipeline,
+        tokenizer=None,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
+        history=pd.DataFrame(),
+        id_to_clause=id_to_clause,
+        val_logits=val_logits,
+        val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
+    )
+
+
+# ─── Ensemble helper ────────────────────────────────────────────────────────
+
+
+class _EnsemblePipeline:
+    """Averages probabilities from two pipelines that each expose predict_proba."""
+
+    def __init__(self, pipeline_a, pipeline_b, weight_a: float = 0.5):
+        self.pipeline_a = pipeline_a
+        self.pipeline_b = pipeline_b
+        self.weight_a = weight_a
+
+    def predict_proba(self, texts: list[str]) -> np.ndarray:
+        pa = self.pipeline_a.predict_proba(texts)
+        pb = self.pipeline_b.predict_proba(texts)
+        return self.weight_a * pa + (1.0 - self.weight_a) * pb
+
+
+def ensemble_artifacts(
+    artifacts_a: ModelArtifacts,
+    artifacts_b: ModelArtifacts,
+    weight_a: float | None = 0.5,
+    artifact_name: str = "Ensemble (TF-IDF + MiniLM)",
+    verbose: bool = True,
+) -> ModelArtifacts:
+    """Average two models' validation probabilities and re-tune threshold.
+
+    If ``weight_a`` is None, sweep weights in {0.1, 0.3, 0.5, 0.7, 0.9} and pick the
+    one that maximises micro-F1 on the validation set (one hyperparameter tuned on
+    val — fair for a held-out test set later).
+
+    Assumes both artifacts were evaluated on the same validation set in the same order.
+    """
+    from scipy.special import expit as sigmoid
+
+    pa = sigmoid(artifacts_a.val_logits)
+    pb = sigmoid(artifacts_b.val_logits)
+    val_labels = artifacts_a.val_labels  # same val set
+    eps = 1e-7
+
+    def _logits_for(weight: float) -> np.ndarray:
+        p_avg = weight * pa + (1.0 - weight) * pb
+        p_clip = np.clip(p_avg, eps, 1 - eps)
+        return np.log(p_clip / (1 - p_clip))
+
+    if weight_a is None:
+        candidates = [0.1, 0.3, 0.5, 0.7, 0.9]
+        best_w, best_f1, best_logits, best_t, best_metrics = 0.5, -1.0, None, 0.5, {}
+        for w in candidates:
+            logits_w = _logits_for(w)
+            t_w, metrics_w = _tune_global_threshold(logits_w, val_labels)
+            if metrics_w["micro_f1"] > best_f1:
+                best_w, best_f1, best_logits = w, metrics_w["micro_f1"], logits_w
+                best_t, best_metrics = t_w, metrics_w
+        weight_a = best_w
+        val_logits = best_logits
+        val_metrics = best_metrics
+        best_t_out = best_t
+        if verbose:
+            print(f"  ensemble weight sweep → best weight_a={weight_a} (micro_F1={best_f1:.4f})")
+    else:
+        val_logits = _logits_for(weight_a)
+        best_t_out, val_metrics = _tune_global_threshold(val_logits, val_labels)
+
+    pipeline = _EnsemblePipeline(artifacts_a.model, artifacts_b.model, weight_a=weight_a)
+    summary = _summarize_validation_run(val_logits, val_labels, artifacts_a.id_to_clause)
+
+    if verbose:
+        print(
+            f"{artifact_name} → "
+            f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+            f"temperature={summary['calibration_temperature']:.2f}, "
+            f"threshold={summary['best_threshold']:.2f}, "
+            f"weight_a={weight_a}"
+        )
+
+    return ModelArtifacts(
+        model_name=artifact_name,
+        model=pipeline,
+        tokenizer=None,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
+        history=pd.DataFrame(),
+        id_to_clause=artifacts_a.id_to_clause,
+        val_logits=val_logits,
+        val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+    )
+
+
+# ─── Early-fusion hybrid (TF-IDF ⊕ MiniLM embeddings) ──────────────────────
+
+
+class _HybridFeaturePipeline:
+    """Concatenates sparse TF-IDF features with dense MiniLM embeddings at inference.
+
+    predict_proba(texts) -> (n_texts, n_labels) class-1 probabilities.
+    Reuses an already-fit vectorizer and embedding encoder.
+    """
+
+    def __init__(self, vectorizer, embedding_pipeline: "_EmbeddingPipeline",
+                 estimators: list, minilm_scale: float = 1.0):
+        self.vectorizer = vectorizer
+        self.embedding_pipeline = embedding_pipeline
+        self.estimators_ = estimators
+        self.minilm_scale = float(minilm_scale)
+
+    def _transform(self, texts: list[str]):
+        from scipy.sparse import hstack, csr_matrix
+        X_tfidf = self.vectorizer.transform(texts)               # sparse
+        X_emb   = self.embedding_pipeline.encode_contracts(texts)  # dense
+        X_emb   = X_emb * self.minilm_scale
+        return hstack([X_tfidf, csr_matrix(X_emb)]).tocsr()
+
+    def predict_proba(self, texts: list[str]) -> np.ndarray:
+        X = self._transform(texts)
+        return np.column_stack([_tfidf_proba_col(e, X) for e in self.estimators_])
+
+
+def train_hybrid_features_lr(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    id_to_clause: dict[int, str],
+    ngram_word: tuple[int, int] = (1, 3),
+    ngram_char: tuple[int, int] = (3, 5),
+    max_features_word: int = 100_000,
+    max_features_char: int = 50_000,
+    encoder_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    cache_path: str | None = "checkpoints/minilm_embeddings.npz",
+    tune_C: bool = False,
+    minilm_scale: float = 1.0,
+    artifact_name: str = "V7 — Hybrid features (TF-IDF ⊕ MiniLM)",
+    verbose: bool = True,
+    seed: int = 42,
+) -> ModelArtifacts:
+    """Early-fusion: concatenate TF-IDF (word+char) sparse features with dense MiniLM
+    embeddings and train per-label LR on the joint matrix.
+
+    Usually beats late-fusion (probability averaging) when one model (MiniLM here) is
+    much weaker — the LR learns to weight each feature source per-label rather than
+    forcing a single global weight_a.
+    """
+    from pathlib import Path
+    from scipy.sparse import hstack, csr_matrix
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.dummy import DummyClassifier
+    from sklearn.pipeline import FeatureUnion
+    from sklearn.model_selection import GridSearchCV
+
+    set_global_seed(seed)
+    train_texts, train_labels = _build_contract_matrix(train_df, id_to_clause)
+    val_texts,   val_labels   = _build_contract_matrix(val_df,   id_to_clause)
+
+    # 1) TF-IDF (word + char)
+    vectorizer = FeatureUnion([
+        ("word", TfidfVectorizer(
+            analyzer="word", ngram_range=ngram_word,
+            max_features=max_features_word, sublinear_tf=True,
+        )),
+        ("char", TfidfVectorizer(
+            analyzer="char_wb", ngram_range=ngram_char,
+            max_features=max_features_char, sublinear_tf=True,
+        )),
+    ])
+    X_train_tfidf = vectorizer.fit_transform(train_texts)
+    X_val_tfidf   = vectorizer.transform(val_texts)
+
+    # 2) MiniLM embeddings (cached npz: {"train": ..., "val": ...})
+    emb_pipeline = _EmbeddingPipeline(encoder_name, estimators=[])
+    cache_ok = False
+    if cache_path and Path(cache_path).exists():
+        try:
+            cached = np.load(cache_path)
+            X_train_emb, X_val_emb = cached["train"], cached["val"]
+            if (X_train_emb.shape[0] == len(train_texts)
+                and X_val_emb.shape[0] == len(val_texts)):
+                cache_ok = True
+                if verbose:
+                    print(f"Loaded cached MiniLM embeddings from {cache_path}")
+        except Exception:
+            cache_ok = False
+    if not cache_ok:
+        if verbose:
+            print(f"Encoding {len(train_texts) + len(val_texts)} contracts with {encoder_name}…")
+        X_train_emb = emb_pipeline.encode_contracts(train_texts)
+        X_val_emb   = emb_pipeline.encode_contracts(val_texts)
+        if cache_path:
+            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+            np.savez(cache_path, train=X_train_emb, val=X_val_emb)
+
+    # 3) Concatenate. Scale MiniLM features so L2-regularized LR doesn't drown them
+    # under 150k sparse TF-IDF dims (each MiniLM coefficient pays the same regularization
+    # cost as each TF-IDF coefficient; scaling features up lets the LR choose to use them).
+    X_train_emb_scaled = X_train_emb * float(minilm_scale)
+    X_val_emb_scaled   = X_val_emb   * float(minilm_scale)
+    X_train = hstack([X_train_tfidf, csr_matrix(X_train_emb_scaled)]).tocsr()
+    X_val   = hstack([X_val_tfidf,   csr_matrix(X_val_emb_scaled)]).tocsr()
+
+    if verbose:
+        print(f"Hybrid features: {X_train.shape[1]:,} (TF-IDF {X_train_tfidf.shape[1]:,} + MiniLM {X_train_emb.shape[1]} × {minilm_scale})")
+
+    # 4) Per-label LR (same safe-CV logic as v2)
+    C_grid = [0.1, 1.0, 10.0]
+    estimators = []
+    for i in range(train_labels.shape[1]):
+        col = train_labels[:, i]
+        if len(np.unique(col)) < 2:
+            est = DummyClassifier(strategy="most_frequent")
+            est.fit(X_train, col)
+            estimators.append(est)
+            continue
+
+        n_pos = int(col.sum())
+        n_neg = int(len(col) - n_pos)
+        min_class = min(n_pos, n_neg)
+        cv_safe = min(3, min_class)
+
+        if tune_C and min_class >= 10:
+            base = LogisticRegression(
+                class_weight="balanced",
+                max_iter=1000,
+                solver="lbfgs",
+                random_state=seed,
+            )
+            gs = GridSearchCV(base, {"C": C_grid}, cv=cv_safe, scoring="f1", n_jobs=1)
+            gs.fit(X_train, col)
+            best_C = float(gs.best_params_["C"])
+        else:
+            best_C = 1.0
+
+        est = LogisticRegression(
+            class_weight="balanced",
+            max_iter=1000,
+            C=best_C,
+            solver="lbfgs",
+            random_state=seed,
+        )
+        est.fit(X_train, col)
+        estimators.append(est)
+
+    # 5) Probabilities → log-odds for sigmoid-based evaluators
+    eps = 1e-7
+    val_probs = np.column_stack([_tfidf_proba_col(est, X_val) for est in estimators])
+    p = np.clip(val_probs, eps, 1 - eps)
+    val_logits = np.log(p / (1 - p))
+
+    summary = _summarize_validation_run(val_logits, val_labels, id_to_clause)
+
+    # Wire up inference pipeline; emb_pipeline needs estimators=[] (unused) but a live encoder
+    pipeline = _HybridFeaturePipeline(vectorizer, emb_pipeline, estimators, minilm_scale=minilm_scale)
+
+    if verbose:
+        print(
+            f"{artifact_name} → "
+            f"val contract micro_F1={summary['val_metrics']['micro_f1']:.4f}, "
+            f"temperature={summary['calibration_temperature']:.2f}, "
+            f"threshold={summary['best_threshold']:.2f}"
+        )
+
+    return ModelArtifacts(
+        model_name=artifact_name,
+        model=pipeline,
+        tokenizer=None,
+        best_threshold=summary["best_threshold"],
+        val_metrics=summary["val_metrics"],
+        history=pd.DataFrame(),
+        id_to_clause=id_to_clause,
+        val_logits=val_logits,
+        val_labels=val_labels,
+        per_clause_thresholds=summary["per_clause_thresholds"],
+        calibration_temperature=summary["calibration_temperature"],
+        val_contract_metrics=summary["val_contract_metrics"],
+        val_chunk_metrics=summary["val_chunk_metrics"],
+        random_seed=seed,
     )

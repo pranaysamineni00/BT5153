@@ -1,6 +1,16 @@
 flask>=3.0.0
 flask-cors>=4.0.0
+openai>=1.30
+numpy
+pandas
+scikit-learn
+joblib
+huggingface_hub
+torch>=2.0
+transformers>=4.36
+sentence-transformers>=2.5
+faiss-cpu>=1.8
 pypdf>=4.0.0
 python-docx>=1.1.0
-openai>=1.40.0
 python-dotenv>=1.0.0
+waitress>=3.0.0

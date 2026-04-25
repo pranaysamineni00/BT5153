@@ -10,6 +10,8 @@ from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 
+DEFAULT_NEGATIVE_CHUNK_WEIGHT = 0.1
+
 
 # ── Clause filtering ──────────────────────────────────────────────────────────
 
@@ -236,6 +238,11 @@ def build_chunk_examples(
                 "input_ids": chunked["input_ids"][chunk_index],
                 "attention_mask": chunked["attention_mask"][chunk_index],
                 "labels": labels.tolist(),
+                "sample_weight": (
+                    DEFAULT_NEGATIVE_CHUNK_WEIGHT
+                    if not labels.any()
+                    else 1.0
+                ),
             }
             if "token_type_ids" in chunked:
                 chunk_example["token_type_ids"] = chunked["token_type_ids"][chunk_index]
@@ -260,6 +267,7 @@ class MultiLabelChunkDataset(Dataset):
             "input_ids": torch.tensor(ex["input_ids"], dtype=torch.long),
             "attention_mask": torch.tensor(ex["attention_mask"], dtype=torch.long),
             "labels": torch.tensor(ex["labels"], dtype=torch.float32),
+            "sample_weight": torch.tensor(ex.get("sample_weight", 1.0), dtype=torch.float32),
         }
         if "token_type_ids" in ex:
             item["token_type_ids"] = torch.tensor(ex["token_type_ids"], dtype=torch.long)
@@ -270,7 +278,7 @@ class MultiLabelChunkDataset(Dataset):
 
 def compute_sample_weights(
     chunk_examples: list[dict[str, Any]],
-    negative_weight: float = 0.1,
+    negative_weight: float = DEFAULT_NEGATIVE_CHUNK_WEIGHT,
 ) -> list[float]:
     """Per-sample loss weights: all-negative chunks get negative_weight, others get 1.0.
 
@@ -279,6 +287,9 @@ def compute_sample_weights(
     """
     weights = []
     for ex in chunk_examples:
+        if "sample_weight" in ex:
+            weights.append(float(ex["sample_weight"]))
+            continue
         is_all_negative = all(label_val == 0.0 for label_val in ex["labels"])
         weights.append(negative_weight if is_all_negative else 1.0)
     return weights
