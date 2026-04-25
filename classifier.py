@@ -16,31 +16,30 @@ logger = logging.getLogger(__name__)
 
 CUAD_CLAUSES: list[str] = sorted([
     "Affiliate License-Licensee", "Affiliate License-Licensor",
-    "Agreement Date", "Anti-Assignment", "Arbitration", "Audit Rights",
-    "Cap On Liability", "Change Of Control", "Covenant Not To Sue",
-    "Dispute Resolution", "Document Name", "Effective Date", "Exclusivity",
-    "Expiration Date", "Force Majeure", "Governing Law",
-    "IP Ownership Assignment", "Indemnification", "Insurance",
-    "Irrevocable Or Perpetual License", "Joint IP Ownership", "License Grant",
-    "Liquidated Damages", "Most Favored Nation", "No-Solicit Of Customers",
-    "No-Solicit Of Employees", "Non-Compete", "Non-Disparagement",
-    "Non-Transferable License", "Notice Period To Terminate Renewal",
-    "Parties", "Post-Termination Services", "ROFR/ROFO/ROFN", "Renewal Term",
-    "Revenue/Profit Sharing", "Source Code Escrow",
-    "Termination For Convenience", "Third Party Beneficiary",
-    "Uncapped Liability", "Warranty Duration",
+    "Agreement Date", "Anti-Assignment", "Audit Rights",
+    "Cap On Liability", "Change Of Control", "Competitive Restriction Exception",
+    "Covenant Not To Sue", "Document Name", "Effective Date", "Exclusivity",
+    "Expiration Date", "Governing Law",
+    "Ip Ownership Assignment", "Insurance",
+    "Irrevocable Or Perpetual License", "Joint Ip Ownership", "License Grant",
+    "Liquidated Damages", "Minimum Commitment", "Most Favored Nation",
+    "No-Solicit Of Customers", "No-Solicit Of Employees", "Non-Compete",
+    "Non-Disparagement", "Non-Transferable License",
+    "Notice Period To Terminate Renewal",
+    "Parties", "Post-Termination Services", "Rofr/Rofo/Rofn", "Renewal Term",
+    "Revenue/Profit Sharing", "Termination For Convenience",
+    "Third Party Beneficiary", "Uncapped Liability", "Volume Restriction",
+    "Warranty Duration",
 ])
 
 RISK_LEVELS: dict[str, str] = {
     "Uncapped Liability":             "HIGH",
-    "IP Ownership Assignment":        "HIGH",
+    "Ip Ownership Assignment":        "HIGH",
     "Non-Compete":                    "HIGH",
     "Anti-Assignment":                "HIGH",
-    "Source Code Escrow":             "HIGH",
     "Covenant Not To Sue":            "HIGH",
     "Irrevocable Or Perpetual License": "HIGH",
     "Cap On Liability":               "MEDIUM",
-    "Indemnification":                "MEDIUM",
     "Non-Disparagement":              "MEDIUM",
     "No-Solicit Of Customers":        "MEDIUM",
     "No-Solicit Of Employees":        "MEDIUM",
@@ -52,10 +51,12 @@ RISK_LEVELS: dict[str, str] = {
     "Termination For Convenience":    "MEDIUM",
     "Affiliate License-Licensor":     "MEDIUM",
     "Affiliate License-Licensee":     "MEDIUM",
-    "Joint IP Ownership":             "MEDIUM",
+    "Joint Ip Ownership":             "MEDIUM",
     "Most Favored Nation":            "MEDIUM",
     "Third Party Beneficiary":        "MEDIUM",
     "Non-Transferable License":       "MEDIUM",
+    "Minimum Commitment":             "MEDIUM",
+    "Volume Restriction":             "MEDIUM",
     "Governing Law":                  "LOW",
     "Agreement Date":                 "LOW",
     "Effective Date":                 "LOW",
@@ -64,25 +65,23 @@ RISK_LEVELS: dict[str, str] = {
     "Document Name":                  "LOW",
     "Renewal Term":                   "LOW",
     "Notice Period To Terminate Renewal": "LOW",
-    "Force Majeure":                  "LOW",
     "Warranty Duration":              "LOW",
     "Insurance":                      "LOW",
-    "Arbitration":                    "LOW",
-    "Dispute Resolution":             "LOW",
     "License Grant":                  "LOW",
     "Audit Rights":                   "LOW",
-    "ROFR/ROFO/ROFN":                 "LOW",
+    "Rofr/Rofo/Rofn":                 "LOW",
+    "Competitive Restriction Exception": "LOW",
 }
 
 CATEGORIES: dict[str, list[str]] = {
     "Contract Basics":       ["Document Name", "Parties", "Agreement Date", "Effective Date", "Expiration Date"],
     "Term & Duration":       ["Renewal Term", "Notice Period To Terminate Renewal", "Termination For Convenience", "Post-Termination Services"],
-    "Financial & Liability": ["Cap On Liability", "Uncapped Liability", "Liquidated Damages", "Revenue/Profit Sharing", "Insurance"],
-    "Risk & Indemnity":      ["Indemnification", "Covenant Not To Sue", "Force Majeure"],
-    "IP & Licensing":        ["License Grant", "IP Ownership Assignment", "Joint IP Ownership", "Affiliate License-Licensor", "Affiliate License-Licensee", "Irrevocable Or Perpetual License", "Non-Transferable License", "Source Code Escrow"],
-    "Restrictive Covenants": ["Non-Compete", "Non-Disparagement", "No-Solicit Of Customers", "No-Solicit Of Employees", "Exclusivity"],
-    "Contract Rights":       ["Anti-Assignment", "Change Of Control", "Audit Rights", "ROFR/ROFO/ROFN", "Third Party Beneficiary", "Most Favored Nation"],
-    "Dispute Resolution":    ["Governing Law", "Dispute Resolution", "Arbitration"],
+    "Financial & Liability": ["Cap On Liability", "Uncapped Liability", "Liquidated Damages", "Revenue/Profit Sharing", "Insurance", "Minimum Commitment", "Volume Restriction"],
+    "Risk & Indemnity":      ["Covenant Not To Sue"],
+    "IP & Licensing":        ["License Grant", "Ip Ownership Assignment", "Joint Ip Ownership", "Affiliate License-Licensor", "Affiliate License-Licensee", "Irrevocable Or Perpetual License", "Non-Transferable License"],
+    "Restrictive Covenants": ["Non-Compete", "Non-Disparagement", "No-Solicit Of Customers", "No-Solicit Of Employees", "Exclusivity", "Competitive Restriction Exception"],
+    "Contract Rights":       ["Anti-Assignment", "Change Of Control", "Audit Rights", "Rofr/Rofo/Rofn", "Third Party Beneficiary", "Most Favored Nation"],
+    "Governing Law":         ["Governing Law"],
     "Warranties":            ["Warranty Duration"],
 }
 
@@ -158,6 +157,14 @@ _KW: dict[str, list[str]] = {
         r"acquisition\s+of\s+.{0,30}controlling\s+interest",
         r"undergo\s+a\s+change\s+of\s+control",
     ],
+    "Competitive Restriction Exception": [
+        r"notwithstanding\s+.{0,60}(?:non-?compet|exclusiv|restrict)",
+        r"except(?:ion)?\s+.{0,40}(?:compet|exclusiv|restrict)\s+.{0,30}(?:clause|provision|obligation)",
+        r"shall\s+not\s+apply\s+.{0,40}(?:compet|exclusiv)",
+        r"carve.?out\s+.{0,30}(?:compet|exclusiv|restrict)",
+        r"permitted\s+.{0,20}(?:compet|exclusiv|activit)",
+        r"exception\s+to\s+.{0,30}(?:non-?compet|exclusiv)",
+    ],
     "Covenant Not To Sue": [
         r"covenant\s+not\s+to\s+sue",
         r"agrees?\s+not\s+to\s+.{0,30}(?:bring|file|initiate|commence)\s+.{0,20}(?:suit|action|claim|proceeding)",
@@ -219,7 +226,7 @@ _KW: dict[str, list[str]] = {
         r"construed\s+in\s+accordance\s+with\s+the\s+laws",
         r"choice\s+of\s+law",
     ],
-    "IP Ownership Assignment": [
+    "Ip Ownership Assignment": [
         r"assigns?\s+.{0,30}(?:all\s+)?(?:right|title|interest)\s+.{0,30}intellectual\s+property",
         r"work\s+made\s+for\s+hire",
         r"intellectual\s+property\s+.{0,30}(?:shall\s+)?(?:vest\s+in|belong\s+to|owned\s+by)",
@@ -227,12 +234,6 @@ _KW: dict[str, list[str]] = {
         r"hereby\s+assigns?\s+to",
         r"assignment\s+of\s+intellectual\s+property",
         r"ip\s+ownership\s+.{0,20}(?:assign|transfer|vest)",
-    ],
-    "Indemnification": [
-        r"indemnif\w+",
-        r"hold\s+harmless",
-        r"defend(?:s|ed|ing)?\s+.{0,40}(?:from|against)\s+.{0,40}(?:claim|loss|liability|damage)",
-        r"indemnity\s+obligation",
     ],
     "Insurance": [
         r"(?:maintain|carry|obtain|procure)\s+.{0,30}insurance",
@@ -249,7 +250,7 @@ _KW: dict[str, list[str]] = {
         r"perpetual\s+license",
         r"license\s+.{0,20}irrevocable",
     ],
-    "Joint IP Ownership": [
+    "Joint Ip Ownership": [
         r"jointly\s+own",
         r"joint\s+ownership\s+of\s+.{0,30}intellectual\s+property",
         r"co-?own\w*",
@@ -271,12 +272,26 @@ _KW: dict[str, list[str]] = {
         r"pre-?agreed\s+(?:monetary\s+)?damages",
         r"ascertaining\s+actual\s+damages",
     ],
+    "Minimum Commitment": [
+        r"minimum\s+(?:purchase|order|commitment|spend|volume|quantity)",
+        r"commit(?:s|ted|ment)\s+to\s+purchase\s+.{0,30}minimum",
+        r"minimum\s+annual\s+(?:revenue|payment|spend|purchase)",
+        r"at\s+least\s+.{0,20}(?:per\s+(?:year|month|quarter)|annually)",
+        r"minimum\s+guaranteed\s+(?:revenue|amount|payment)",
+    ],
     "Most Favored Nation": [
         r"most.?favou?red\s+nation",
         r"\bMFN\b",
         r"no\s+less\s+favou?rable\s+terms\s+than",
         r"best\s+(?:available\s+)?price\s+.{0,40}any\s+other\s+customer",
         r"most\s+favorable\s+terms",
+    ],
+    "Volume Restriction": [
+        r"volume\s+(?:restriction|cap|limit|ceiling)",
+        r"maximum\s+(?:volume|quantity|units?|orders?)\s+.{0,30}(?:per|during|in\s+any)",
+        r"not\s+(?:to\s+)?exceed\s+.{0,30}(?:units?|volume|quantity)",
+        r"limit\w*\s+(?:the\s+)?(?:total\s+)?(?:volume|quantity|number\s+of\s+units?)",
+        r"annual\s+(?:cap|limit)\s+.{0,20}(?:units?|volume|quantity)",
     ],
     "No-Solicit Of Customers": [
         r"not\s+(?:to\s+)?solicit\s+.{0,30}(?:customers?|clients?|accounts?)",
@@ -334,7 +349,7 @@ _KW: dict[str, list[str]] = {
         r"following\s+terminat\w+\s+.{0,40}shall\s+(?:continue|provide|assist)",
         r"survival\s+.{0,20}terminat\w+\s+.{0,20}services?",
     ],
-    "ROFR/ROFO/ROFN": [
+    "Rofr/Rofo/Rofn": [
         r"right\s+of\s+first\s+refusal",
         r"right\s+of\s+first\s+offer",
         r"right\s+of\s+first\s+negotiation",
@@ -430,6 +445,70 @@ def _find_snippet(text: str, clause: str) -> str:
     return ""
 
 
+def _extract_excerpt_via_llm(full_text: str, clause_name: str, client) -> str:
+    """Ask an LLM to quote the passage that best establishes the presence of
+    `clause_name` in `full_text`. The BERT model has already flagged the clause
+    as present, so the LLM is instructed to always return its best-available
+    passage — never NONE. Large documents are chunked on paragraph boundaries;
+    the first chunk that yields an excerpt wins."""
+    MAX_CHARS = 80000  # ~20K tokens — safe margin under gpt-4o-mini's 128K context
+
+    def _call(chunk: str) -> str:
+        user_prompt = (
+            f"You are analyzing a legal contract. A neural classifier has already "
+            f"identified a \"{clause_name}\" clause in this contract. Your job is "
+            f"to quote the single passage that best supports that finding.\n\n"
+            f"Rules:\n"
+            f"- Return the exact text from the contract, character-for-character.\n"
+            f"- Quote one self-contained passage (typically 1–6 sentences).\n"
+            f"- Do not add commentary, labels, or wrapping quotation marks.\n"
+            f"- ALWAYS return a passage. If no section is a perfect match, return "
+            f"the closest paragraph — an imperfect quote is better than nothing.\n"
+            f"- Do not return the word NONE or refuse to quote.\n\n"
+            f"Contract:\n\"\"\"\n{chunk}\n\"\"\""
+        )
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You extract supporting passages from legal contracts. Always return a quoted passage from the provided text — never refuse, never return NONE."},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0,
+                max_tokens=600,
+            )
+            content = (response.choices[0].message.content or "").strip()
+        except Exception as exc:
+            logger.warning("LLM excerpt extraction failed for '%s': %s", clause_name, exc)
+            return ""
+
+        if not content or content.upper() == "NONE":
+            return ""
+        if content.startswith('"') and content.endswith('"') and len(content) > 1:
+            content = content[1:-1].strip()
+        return content
+
+    if len(full_text) <= MAX_CHARS:
+        return _call(full_text)
+
+    chunks: list[str] = []
+    cur = ""
+    for para in full_text.split('\n\n'):
+        if cur and len(cur) + len(para) + 2 > MAX_CHARS:
+            chunks.append(cur)
+            cur = para
+        else:
+            cur = (cur + '\n\n' + para) if cur else para
+    if cur:
+        chunks.append(cur)
+
+    for chunk in chunks:
+        excerpt = _call(chunk)
+        if excerpt:
+            return excerpt
+    return ""
+
+
 def _find_snippet_by_terms(text: str, clause: str) -> str:
     """Term-density fallback. Used only as a last-resort within a model-identified window."""
     _STOP = {'of', 'or', 'and', 'the', 'a', 'an', 'to', 'in', 'for', 'on', 'at', 'not'}
@@ -452,46 +531,73 @@ def _find_snippet_by_terms(text: str, clause: str) -> str:
     return best_para
 
 
-def _candidate_spans(text: str, min_len: int = 60, max_len: int = 1200) -> list[str]:
-    """Split a window into clause-sized candidate spans for model rescoring.
-
-    Prefers paragraph breaks; merges fragments shorter than min_len with neighbors;
-    splits paragraphs longer than max_len on sentence boundaries. Generalizes across
-    legal documents — no hardcoded section names or keywords."""
-    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
-    if not paragraphs:
-        paragraphs = [text.strip()] if text.strip() else []
-
-    out: list[str] = []
-    for p in paragraphs:
-        if len(p) > max_len:
-            # Split overlong paragraphs on sentence boundaries
-            sents = re.split(r'(?<=[.!?])\s+(?=[A-Z(])', p)
-            cur = ""
-            for s in sents:
-                if cur and len(cur) + len(s) + 1 > max_len:
-                    out.append(cur)
-                    cur = s
-                else:
-                    cur = (cur + ' ' + s).strip() if cur else s
-            if cur:
-                out.append(cur)
-        elif len(p) < min_len and out and len(out[-1]) + len(p) + 1 <= max_len:
-            out[-1] = (out[-1] + ' ' + p).strip()
-        else:
-            out.append(p)
-
-    return [c for c in out if len(c) >= 30]
+_RISK_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 
 
-def _trim_snippet(snippet: str, max_chars: int = 700) -> str:
-    """Trim a snippet to max_chars at a clean word boundary."""
+def _dedupe_by_snippet(results: list[dict]) -> list[dict]:
+    """Merge results that share the same supporting excerpt into a single entry.
+
+    When several clauses pick the exact same paragraph as their strongest
+    evidence, group them into one card. The merged entry keeps the highest-
+    confidence clause as primary (its name, category, and confidence drive
+    sorting and the badge), uses the worst risk level among the grouped
+    clauses, and lists every co-detected clause via co_clauses so the UI can
+    show them together. Without this step the same paragraph appears in 3-4
+    cards, each labeled with a different clause type — confusing and noisy."""
+
+    def _norm(s: str) -> str:
+        return re.sub(r'\s+', ' ', s).strip() if s else ''
+
+    groups: dict[str, list[dict]] = {}
+    for r in results:
+        key = _norm(r.get("snippet", ""))
+        if not key:
+            # No snippet — keep as standalone (key per-clause to avoid merging)
+            key = f"__nosnippet__::{r['clause']}"
+        groups.setdefault(key, []).append(r)
+
+    merged: list[dict] = []
+    for items in groups.values():
+        items.sort(key=lambda r: r["confidence"], reverse=True)
+        primary = items[0]
+        if len(items) == 1:
+            merged.append(primary)
+            continue
+
+        worst_risk = min((r["risk"] for r in items),
+                         key=lambda r: _RISK_ORDER.get(r, 3))
+        co_clauses = [
+            {
+                "clause":     r["clause"],
+                "confidence": r["confidence"],
+                "risk":       r["risk"],
+                "category":   r["category"],
+            }
+            for r in items
+        ]
+        merged_entry = dict(primary)
+        merged_entry["risk"] = worst_risk
+        merged_entry["co_clauses"] = co_clauses
+        merged.append(merged_entry)
+
+    merged.sort(key=lambda r: (_RISK_ORDER.get(r["risk"], 3), -r["confidence"]))
+    return merged
+
+
+def _trim_snippet(snippet: str, max_chars: int = 800) -> str:
+    """Trim a snippet to max_chars, preferring sentence boundaries over word boundaries."""
     if len(snippet) <= max_chars:
         return snippet
     trimmed = snippet[:max_chars]
-    cut = trimmed.rfind(' ')
-    if cut > max_chars - 100:
-        trimmed = trimmed[:cut]
+    sentence_cut = max(
+        trimmed.rfind('. '), trimmed.rfind('.\n'),
+        trimmed.rfind('? '), trimmed.rfind('! '),
+    )
+    if sentence_cut > max_chars - 250:
+        return trimmed[:sentence_cut + 1].rstrip() + ' …'
+    word_cut = trimmed.rfind(' ')
+    if word_cut > max_chars - 100:
+        trimmed = trimmed[:word_cut]
     return trimmed.rstrip() + '…'
 
 
@@ -583,63 +689,40 @@ class LegalClauseClassifier:
         except Exception as exc:
             raise RuntimeError(f"Checkpoint load failed: {exc}") from exc
 
-    def _rescore_candidates(self, candidates: list[str], batch_size: int = 8) -> np.ndarray:
-        """Run the same fine-tuned model over short candidate spans. Returns
-        an (n_candidates, n_labels) probability matrix. Used to align retrieval
-        with detection — the snippet shown is literally the span the model
-        scores highest for the detected label."""
-        import torch
-
-        n_labels = len(self.id_to_clause)
-        if not candidates:
-            return np.zeros((0, n_labels), dtype=np.float32)
-
-        probs_all = np.zeros((len(candidates), n_labels), dtype=np.float32)
-        for start in range(0, len(candidates), batch_size):
-            batch = candidates[start:start + batch_size]
-            enc = self.tokenizer(
-                batch,
-                max_length=512,
-                truncation=True,
-                padding=True,
-                return_tensors="pt",
-            )
-            enc = {k: v.to(self._device) for k, v in enc.items()}
-            with torch.no_grad():
-                logits = self.model(**enc).logits.cpu().numpy()
-            probs_all[start:start + len(batch)] = 1.0 / (1.0 + np.exp(-np.clip(logits, -500, 500)))
-        return probs_all
+    def _get_openai_client(self):
+        """Return a cached OpenAI client, or None if the API key or SDK is missing.
+        A missing client is non-fatal: detection still runs; excerpts come back empty
+        and the UI hides the 'View supporting excerpt' control."""
+        if hasattr(self, "_openai_client"):
+            return self._openai_client
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            logger.warning("OPENAI_API_KEY not set — supporting excerpts will be empty.")
+            self._openai_client = None
+            return None
+        try:
+            from openai import OpenAI
+            self._openai_client = OpenAI(api_key=api_key)
+        except ImportError:
+            logger.warning("openai package not installed — supporting excerpts will be empty.")
+            self._openai_client = None
+        return self._openai_client
 
     def _classify_model(self, text: str) -> list[dict]:
-        """Detect clauses and locate their supporting spans using the SAME model
-        for both. The window where label X scores highest is, by construction, the
-        strongest evidence span for X. We then rescore paragraph-sized candidates
-        within that window to pick the most evidentiary excerpt — eliminating the
-        keyword/term-density mismatch the prior architecture produced."""
+        """Detect clauses with Legal-BERT over sliding windows. Supporting
+        excerpts are intentionally NOT generated here — each excerpt is an LLM
+        round-trip and doing ~20 of them eagerly makes the loading screen
+        unusable. Excerpts are produced lazily via `extract_excerpt` on demand."""
         import torch
 
-        # Try fast tokenizer with offset mapping; fall back gracefully if unavailable.
-        try:
-            enc = self.tokenizer(
-                text,
-                max_length=512,
-                stride=128,
-                truncation=True,
-                padding="max_length",
-                return_overflowing_tokens=True,
-                return_offsets_mapping=True,
-            )
-            offsets_available = True
-        except (NotImplementedError, ValueError):
-            enc = self.tokenizer(
-                text,
-                max_length=512,
-                stride=128,
-                truncation=True,
-                padding="max_length",
-                return_overflowing_tokens=True,
-            )
-            offsets_available = False
+        enc = self.tokenizer(
+            text,
+            max_length=512,
+            stride=128,
+            truncation=True,
+            padding="max_length",
+            return_overflowing_tokens=True,
+        )
 
         n_windows = len(enc["input_ids"])
         n_labels = len(self.id_to_clause)
@@ -660,20 +743,7 @@ class LegalClauseClassifier:
             window_probs[i] = 1.0 / (1.0 + np.exp(-np.clip(logits, -500, 500)))
 
         max_probs = window_probs.max(axis=0) if n_windows else np.zeros(n_labels, dtype=np.float32)
-        best_windows = window_probs.argmax(axis=0) if n_windows else np.zeros(n_labels, dtype=np.int64)
 
-        # Map each window to its character span in the source text (Fast tokenizer path)
-        window_spans: list[tuple[int, int]] = []
-        if offsets_available:
-            for i in range(n_windows):
-                offsets = enc["offset_mapping"][i]
-                real = [(s, e) for s, e in offsets if e > s]
-                window_spans.append((real[0][0], real[-1][1]) if real else (0, len(text)))
-        else:
-            # No offsets — treat the whole document as one window for fallback purposes
-            window_spans = [(0, len(text))] * max(n_windows, 1)
-
-        # Identify detected clauses
         detected: list[tuple[int, str, float]] = []
         for label_id, clause_name in self.id_to_clause.items():
             t = self.thresholds.get(clause_name, 0.5)
@@ -681,62 +751,62 @@ class LegalClauseClassifier:
             if prob >= t:
                 detected.append((label_id, clause_name, prob))
 
-        # Build a deduped candidate pool from each winning window. Each candidate
-        # paragraph carries its source-window id so we can match it back to clauses.
-        candidates: list[str] = []
-        candidate_window: list[int] = []
-        if detected:
-            winning_windows = sorted({int(best_windows[lid]) for lid, _, _ in detected})
-            for w in winning_windows:
-                ws, we = window_spans[w]
-                window_text = text[ws:we]
-                for cand in _candidate_spans(window_text):
-                    candidates.append(cand)
-                    candidate_window.append(w)
-
-        cand_probs = self._rescore_candidates(candidates)
-
-        # Pick the highest-scoring candidate within each clause's winning window
-        results: list[dict] = []
-        for label_id, clause_name, prob in detected:
-            best_w = int(best_windows[label_id])
-            snippet = ""
-            best_score = -1.0
-            for j, w in enumerate(candidate_window):
-                if w == best_w and cand_probs[j, label_id] > best_score:
-                    best_score = float(cand_probs[j, label_id])
-                    snippet = candidates[j]
-
-            # Last-resort fallback: keyword/term search constrained to the winning window
-            if not snippet:
-                ws, we = window_spans[best_w]
-                window_text = text[ws:we]
-                snippet = (
-                    _find_snippet(window_text, clause_name)
-                    or _find_snippet_by_terms(window_text, clause_name)
-                    or window_text
-                )
-
-            results.append({
+        results: list[dict] = [
+            {
                 "clause":     clause_name,
                 "confidence": round(prob, 3),
                 "risk":       RISK_LEVELS.get(clause_name, "LOW"),
                 "category":   _get_category(clause_name),
-                "snippet":    _trim_snippet(snippet),
+                "snippet":    "",   # filled lazily by /api/excerpt on card expand
                 "detected":   True,
-            })
-
+            }
+            for _, clause_name, prob in detected
+        ]
         results.sort(key=lambda x: x["confidence"], reverse=True)
         return results
 
+    def extract_excerpt(self, text: str, clause_name: str) -> str:
+        """Lazy per-clause excerpt. Called once per card when the user expands
+        it. Guarantees a non-empty return value by falling through:
+        LLM verbatim → keyword regex → term-density → first substantive paragraph.
+        An imperfect excerpt beats a blank card."""
+        client = self._get_openai_client()
+        if client is not None:
+            excerpt = _extract_excerpt_via_llm(text, clause_name, client)
+            if excerpt:
+                return _trim_snippet(excerpt)
+
+        for finder in (_find_snippet, _find_snippet_by_terms):
+            excerpt = finder(text, clause_name)
+            if excerpt:
+                return _trim_snippet(excerpt)
+
+        for para in (p.strip() for p in text.split('\n\n')):
+            if len(para) > 60:
+                return _trim_snippet(para)
+
+        head = text.strip()[:700]
+        return head if head else "(Clause detected by the neural model; no localizable passage could be isolated.)"
+
     def classify(self, text: str) -> dict:
         clauses = self._classify_model(text)
-        high   = sum(1 for c in clauses if c["risk"] == "HIGH")
-        medium = sum(1 for c in clauses if c["risk"] == "MEDIUM")
-        low    = sum(1 for c in clauses if c["risk"] == "LOW")
+        # Count individual clause detections for the summary, not grouped cards —
+        # users want to see "5 high-risk clauses found", not "3 cards shown".
+        high = medium = low = 0
+        total = 0
+        for c in clauses:
+            items = c.get("co_clauses") or [{"risk": c["risk"]}]
+            for item in items:
+                total += 1
+                if item["risk"] == "HIGH":
+                    high += 1
+                elif item["risk"] == "MEDIUM":
+                    medium += 1
+                else:
+                    low += 1
         return {
             "mode":         self.mode,
-            "total":        len(clauses),
+            "total":        total,
             "risk_summary": {"HIGH": high, "MEDIUM": medium, "LOW": low},
             "clauses":      clauses,
         }

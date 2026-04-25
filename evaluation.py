@@ -39,10 +39,21 @@ def tune_per_clause_thresholds(
     labels: np.ndarray,
     id_to_clause: dict[int, str],
     thresholds: np.ndarray | None = None,
+    min_positives_for_full_sweep: int = 5,
+    rare_class_default: float = 0.5,
 ) -> dict[str, float]:
     """Find the threshold per clause that maximises per-clause F1 on the given logits.
 
-    Returns dict mapping clause_name -> best_threshold (between 0 and 1).
+    For clauses with fewer than `min_positives_for_full_sweep` positives in `labels`,
+    the per-clause F1 sweep on val is dominated by single-example noise (1-3 positives
+    can yield F1=1.0 at an arbitrarily low threshold that does not generalise). For
+    these rare clauses the function returns `rare_class_default` directly without
+    sweeping. The default 0.5 is the Bayes-optimal sigmoid decision boundary under an
+    uninformative prior and the value used by the CUAD baselines (Hendrycks et al.,
+    2021) and Legal-BERT (Chalkidis et al., 2020); the fallback-for-low-support-classes
+    approach follows Yang (1999) "A study of thresholding strategies for text
+    categorization" and Lewis (1995, SIGIR), which both recommend a global default
+    in place of per-class tuning when class support is too small for stable estimation.
     """
     if thresholds is None:
         thresholds = np.arange(0.05, 0.96, 0.05)
@@ -51,6 +62,12 @@ def tune_per_clause_thresholds(
 
     for clause_id, clause_name in id_to_clause.items():
         y_true = labels[:, clause_id].astype(int)
+        n_pos = int(y_true.sum())
+
+        if n_pos < min_positives_for_full_sweep:
+            best[clause_name] = float(rare_class_default)
+            continue
+
         y_score = probs[:, clause_id]
         best_f1 = -1.0
         best_t = 0.5

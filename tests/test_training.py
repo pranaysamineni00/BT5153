@@ -70,11 +70,15 @@ def test_train_bert_cuad_smoke():
     import numpy as np
 
     rows = []
-    for i in range(30):
+    for i in range(60):
         for clause in ["Governing Law", "Non-Compete"]:
             rows.append({
                 "contract_title": f"C{i}", "clause_type": clause,
-                "contract_text": f"This agreement number {i} is governed by the laws of jurisdiction {i % 5}.",
+                "contract_text": (
+                    f"This agreement number {i} is governed by the laws of jurisdiction {i % 5}. "
+                    f"The parties agree to comply with all applicable laws. "
+                    f"Non-compete restrictions apply for a period of two years."
+                ),
                 "has_answer": i % 2 == 0,
                 "answer_texts": ["governed"] if i % 2 == 0 else [],
                 "answer_starts": [14] if i % 2 == 0 else [],
@@ -88,6 +92,7 @@ def test_train_bert_cuad_smoke():
         train_dataset=splits["train_dataset"],
         val_dataset=splits["val_dataset"],
         train_examples=splits["train_examples"],
+        val_examples=splits["val_examples"],
         model_name="distilbert-base-uncased",
         tokenizer=splits["tokenizer"],
         id_to_clause=splits["id_to_clause"],
@@ -104,9 +109,11 @@ def test_train_bert_cuad_smoke():
 
 def test_train_bert_ledgar_cuad_smoke():
     """Smoke: phase 1 LEDGAR fine-tune + phase 2 CUAD fine-tune with minimal batches."""
+    HFDataset = pytest.importorskip("datasets").Dataset
+    ClassLabel = pytest.importorskip("datasets").ClassLabel
+
     from training import train_bert_ledgar_cuad, ModelArtifacts
     from preprocessing import prepare_chunked_splits
-    from datasets import Dataset as HFDataset
     import pandas as pd
     import numpy as np
 
@@ -116,18 +123,19 @@ def test_train_bert_ledgar_cuad_smoke():
         "label": [i % 10 for i in range(40)],
     }
     mock_ledgar = {"train": HFDataset.from_dict(ledgar_data)}
-    # Manually set num_classes on the label feature
-    from datasets import ClassLabel
     mock_ledgar["train"] = mock_ledgar["train"].cast_column(
         "label", ClassLabel(num_classes=10, names=[str(i) for i in range(10)])
     )
 
     rows = []
-    for i in range(30):
+    for i in range(60):
         for clause in ["Governing Law", "Non-Compete"]:
             rows.append({
                 "contract_title": f"C{i}", "clause_type": clause,
-                "contract_text": f"This contract number {i} is governed under jurisdiction {i % 5}.",
+                "contract_text": (
+                    f"This contract number {i} is governed under jurisdiction {i % 5}. "
+                    f"The parties agree to all applicable terms and conditions."
+                ),
                 "has_answer": i % 2 == 0,
                 "answer_texts": ["governed"] if i % 2 == 0 else [],
                 "answer_starts": [13] if i % 2 == 0 else [],
@@ -142,6 +150,7 @@ def test_train_bert_ledgar_cuad_smoke():
         train_dataset=splits["train_dataset"],
         val_dataset=splits["val_dataset"],
         train_examples=splits["train_examples"],
+        val_examples=splits["val_examples"],
         model_name="distilbert-base-uncased",
         tokenizer=splits["tokenizer"],
         id_to_clause=splits["id_to_clause"],
@@ -159,11 +168,12 @@ def test_train_legal_bert_cuad_smoke():
     from preprocessing import prepare_chunked_splits
     import pandas as pd
     rows = []
-    for i in range(30):
+    for i in range(60):
         rows.append({"contract_title": f"C{i}", "clause_type": "Governing Law",
-                     "contract_text": f"legal text {i}", "has_answer": i%2==0,
-                     "answer_texts": ["legal"] if i%2==0 else [],
-                     "answer_starts": [0] if i%2==0 else [], "answer_count": 1 if i%2==0 else 0})
+                     "contract_text": f"This legal agreement number {i} is governed by the applicable laws of the relevant jurisdiction.",
+                     "has_answer": i%2==0,
+                     "answer_texts": ["governed"] if i%2==0 else [],
+                     "answer_starts": [38] if i%2==0 else [], "answer_count": 1 if i%2==0 else 0})
     df = pd.DataFrame(rows)
     splits = prepare_chunked_splits(df, model_name="distilbert-base-uncased",
                                     max_length=64, stride=16, seed=42)
@@ -171,6 +181,7 @@ def test_train_legal_bert_cuad_smoke():
     artifacts = train_bert_cuad(
         splits["train_dataset"], splits["val_dataset"], splits["train_examples"],
         "distilbert-base-uncased", splits["tokenizer"], splits["id_to_clause"],
+        val_examples=splits["val_examples"],
         epochs=1, batch_size=4, max_train_batches=2, max_val_batches=2,
         artifact_name="Legal-BERT (CUAD)",
     )

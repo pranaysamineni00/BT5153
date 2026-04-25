@@ -112,10 +112,11 @@ def test_compute_pos_weight_shape_and_values():
     ]
     weights = compute_pos_weight(examples)
     assert weights.shape == (2,)
-    # label 0: 3 neg / 1 pos = 3.0
-    assert float(weights[0]) == pytest.approx(3.0)
-    # label 1: 1 neg / 3 pos = 1/3
-    assert float(weights[1]) == pytest.approx(1.0 / 3.0, rel=1e-3)
+    # Both labels have <30 positives, so rare_boost (×2) is applied before clipping at 50×.
+    # label 0: (3 neg / 1 pos) × 2 = 6.0
+    assert float(weights[0]) == pytest.approx(6.0)
+    # label 1: (1 neg / 3 pos) × 2 = 2/3
+    assert float(weights[1]) == pytest.approx(2.0 / 3.0, rel=1e-3)
 
 
 def test_aggregate_contract_predictions_takes_max():

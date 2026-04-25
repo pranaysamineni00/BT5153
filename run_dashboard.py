@@ -4,6 +4,7 @@ import subprocess
 import sys
 import time
 import webbrowser
+from pathlib import Path
 
 
 PORT = 5001
@@ -38,7 +39,7 @@ def main() -> None:
 
     server = subprocess.Popen(
         [sys.executable, "app.py"],
-        cwd=str(__file__).rsplit("/", 1)[0],
+        cwd=str(Path(__file__).parent),
     )
 
     print(f"Server starting (PID {server.pid})…")

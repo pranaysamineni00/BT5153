@@ -722,6 +722,70 @@
       text-align: right;
     }
 
+    /* ── Co-detected clauses (when one excerpt covers multiple clause types) ─── */
+    .co-clauses {
+      margin: -4px 0 12px;
+      padding: 8px 10px;
+      background: var(--surface-alt);
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      font-size: 12px;
+      color: var(--ink-2);
+    }
+
+    .co-clauses-label {
+      font-weight: 600;
+      font-size: 10.5px;
+      letter-spacing: .6px;
+      text-transform: uppercase;
+      color: var(--ink-3);
+      margin-bottom: 6px;
+    }
+
+    .co-clause-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 3px 0;
+    }
+
+    .co-clause-item + .co-clause-item {
+      border-top: 1px dashed var(--border);
+    }
+
+    .co-clause-name {
+      font-family: 'Karla', sans-serif;
+      color: var(--ink-1);
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .co-clause-risk {
+      font-size: 9.5px;
+      font-weight: 700;
+      letter-spacing: .5px;
+      padding: 1px 5px;
+      border-radius: 3px;
+      flex-shrink: 0;
+    }
+
+    .co-clause-risk.HIGH   { background: var(--high-bg);  color: var(--high); }
+    .co-clause-risk.MEDIUM { background: var(--med-bg);   color: var(--med); }
+    .co-clause-risk.LOW    { background: var(--low-bg);   color: var(--low); }
+
+    .co-clause-pct {
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 11px;
+      color: var(--ink-2);
+      min-width: 42px;
+      text-align: right;
+      flex-shrink: 0;
+    }
+
     /* ── Snippet ─────────────────────────────────────────────────────────── */
     .snippet-details {
       border-top: 1px solid var(--border);
@@ -769,6 +833,93 @@
       white-space: pre-wrap;
       word-break: break-word;
     }
+
+    .snippet-loading {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--ink-3);
+      font-style: italic;
+      white-space: normal;
+    }
+
+    .snippet-loading .snippet-spinner {
+      width: 12px;
+      height: 12px;
+      border: 2px solid var(--ink-3);
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin .8s linear infinite;
+      flex-shrink: 0;
+    }
+
+    .snippet-error {
+      color: var(--high);
+      font-style: normal;
+    }
+
+    .explain-btn {
+      margin-top: 10px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: .2px;
+      color: var(--navy-2);
+      background: #fff;
+      border: 1px solid var(--border-md);
+      border-radius: var(--r-sm);
+      cursor: pointer;
+      font-family: inherit;
+      transition: background .15s, color .15s, border-color .15s;
+    }
+    .explain-btn:hover:not(:disabled) {
+      background: var(--navy-2);
+      color: #fff;
+      border-color: var(--navy-2);
+    }
+    .explain-btn:disabled {
+      cursor: progress;
+      opacity: .85;
+    }
+    .explain-btn .spinner {
+      width: 12px; height: 12px;
+      border: 2px solid var(--ink-3);
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .explanation-box {
+      margin-top: 10px;
+      padding: 10px 12px;
+      font-size: 13px;
+      line-height: 1.6;
+      color: var(--ink-2);
+      background: #FAFCFF;
+      border: 1px solid #D6E2F3;
+      border-left: 3px solid var(--navy-3);
+      border-radius: var(--r-sm);
+      font-family: 'Karla', sans-serif;
+    }
+    .explanation-box.error {
+      background: var(--high-bg);
+      border-color: var(--high-border);
+      border-left-color: var(--high);
+      color: var(--high);
+    }
+    .explanation-box .explanation-label {
+      font-size: 10.5px;
+      font-weight: 700;
+      letter-spacing: .8px;
+      text-transform: uppercase;
+      color: var(--navy-3);
+      margin-bottom: 6px;
+    }
+    .explanation-box.error .explanation-label { color: var(--high); }
 
     /* ── Animations ──────────────────────────────────────────────────────── */
     @keyframes slideDown {
@@ -1139,8 +1290,15 @@
       }
     });
 
+    // Holds the id of the currently-classified document on the server. Used by
+    // the lazy /api/excerpt endpoint so we don't re-POST the whole text each
+    // time a card is expanded.
+    let currentDocumentId = null;
+
     // ── Render results ────────────────────────────────────────────────────────
     function renderResults(data) {
+      currentDocumentId = data.document_id || null;
+
       // Summary strip
       document.getElementById('stat-total').textContent  = data.total;
       document.getElementById('count-high').textContent  = data.risk_summary.HIGH;
@@ -1185,16 +1343,46 @@
         card.style.animationDelay = (idx * 40) + 'ms';
 
         const pct = (clause.confidence * 100).toFixed(1);
-        const snippetHtml = clause.snippet
-          ? `<details class="snippet-details">
-               <summary class="snippet-summary">
-                 <svg class="snippet-toggle-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
-                   <path stroke-linecap="round" stroke-linejoin="round" d="m8.25 4.5 7.5 7.5-7.5 7.5" />
-                 </svg>
-                 View supporting excerpt
-               </summary>
-               <div class="snippet-text">${escHtml(clause.snippet)}</div>
-             </details>`
+        // Excerpts are generated lazily when the user expands the card — every
+        // detected clause gets a "View supporting excerpt" control regardless
+        // of whether the server has one ready yet.
+        const snippetHtml = `
+          <details class="snippet-details" data-clause="${escAttr(clause.clause || '')}">
+            <summary class="snippet-summary">
+              <svg class="snippet-toggle-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" d="m8.25 4.5 7.5 7.5-7.5 7.5" />
+              </svg>
+              View supporting excerpt
+            </summary>
+            <div class="snippet-text snippet-loading">
+              <span class="snippet-spinner"></span>
+              <span>Locating the supporting passage…</span>
+            </div>
+            <button type="button" class="explain-btn" data-explain
+                    data-excerpt=""
+                    data-clause="${escAttr(clause.clause || '')}"
+                    disabled>
+              Explain further
+            </button>
+            <div class="explanation-slot"></div>
+          </details>`;
+
+        // When one excerpt supports multiple clause types, render a small list
+        // of co-detected clauses below the primary one. Primary = highest-conf.
+        const co = Array.isArray(clause.co_clauses) ? clause.co_clauses : [];
+        const grouped = co.length > 1;
+        const coClausesHtml = grouped
+          ? `<div class="co-clauses">
+               <div class="co-clauses-label">Also detected in this excerpt</div>
+               ${co.slice(1).map(c => {
+                 const cpct = (c.confidence * 100).toFixed(1);
+                 return `<div class="co-clause-item">
+                           <span class="co-clause-name" title="${escAttr(c.clause)}">${escHtml(c.clause)}</span>
+                           <span class="co-clause-risk ${c.risk}">${c.risk}</span>
+                           <span class="co-clause-pct">${cpct}%</span>
+                         </div>`;
+               }).join('')}
+             </div>`
           : '';
 
         card.innerHTML = `
@@ -1209,6 +1397,7 @@
             </div>
             <span class="conf-pct">${pct}%</span>
           </div>
+          ${coClausesHtml}
           ${snippetHtml}
         `;
 
@@ -1221,7 +1410,100 @@
             if (fill) fill.style.width = fill.dataset.target + '%';
           }, 100 + idx * 40);
         });
+
+        const explainBtn = card.querySelector('[data-explain]');
+        if (explainBtn) explainBtn.addEventListener('click', handleExplainClick);
+
+        const details = card.querySelector('.snippet-details');
+        if (details) details.addEventListener('toggle', handleSnippetToggle);
       });
+    }
+
+    async function handleSnippetToggle(ev) {
+      const details = ev.currentTarget;
+      if (!details.open) return;
+      if (details.dataset.loaded === '1') return;
+      // Mark early so a rapid second toggle doesn't double-fire the request.
+      details.dataset.loaded = '1';
+
+      const clause     = details.dataset.clause || '';
+      const textBox    = details.querySelector('.snippet-text');
+      const explainBtn = details.querySelector('[data-explain]');
+
+      if (!currentDocumentId) {
+        textBox.classList.remove('snippet-loading');
+        textBox.classList.add('snippet-error');
+        textBox.textContent = 'No document is loaded. Re-upload to view excerpts.';
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/excerpt', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ document_id: currentDocumentId, clause }),
+        });
+        const data = await res.json();
+
+        if (!res.ok) throw new Error(data.error || 'Could not load excerpt.');
+
+        const excerpt = (data.excerpt || '').trim();
+        textBox.classList.remove('snippet-loading');
+        textBox.textContent = excerpt || '(No passage could be isolated; the clause was detected across the full document.)';
+        if (excerpt && explainBtn) {
+          explainBtn.dataset.excerpt = excerpt;
+          explainBtn.disabled = false;
+        }
+      } catch (err) {
+        details.dataset.loaded = '';   // allow retry on next open
+        textBox.classList.remove('snippet-loading');
+        textBox.classList.add('snippet-error');
+        textBox.textContent = 'Could not load excerpt: ' + (err.message || 'network error') + '. Close and reopen to retry.';
+      }
+    }
+
+    async function handleExplainClick(ev) {
+      const btn = ev.currentTarget;
+      const slot = btn.parentElement.querySelector('.explanation-slot');
+      const excerpt = btn.dataset.excerpt || '';
+      const clause = btn.dataset.clause || '';
+
+      btn.disabled = true;
+      const originalLabel = btn.textContent.trim();
+      btn.innerHTML = `<span class="spinner"></span><span>LLM generating…</span>`;
+      slot.innerHTML = '';
+
+      try {
+        const res = await fetch('/api/explain', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ excerpt, clause }),
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+          slot.innerHTML = `
+            <div class="explanation-box error">
+              <div class="explanation-label">Could not generate explanation</div>
+              ${escHtml(data.error || 'Unknown error.')}
+            </div>`;
+        } else {
+          slot.innerHTML = `
+            <div class="explanation-box">
+              <div class="explanation-label">Plain-English explanation</div>
+              ${escHtml(data.explanation || '')}
+            </div>`;
+        }
+      } catch (err) {
+        slot.innerHTML = `
+          <div class="explanation-box error">
+            <div class="explanation-label">Network error</div>
+            Could not reach the server.
+          </div>`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = originalLabel;
+      }
     }
 
     function escHtml(str) {
@@ -1230,6 +1512,10 @@
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;');
+    }
+
+    function escAttr(str) {
+      return escHtml(str).replace(/'/g, '&#39;');
     }
   </script>
 </body>
