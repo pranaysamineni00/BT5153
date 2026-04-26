@@ -51,6 +51,8 @@ The classifier supports three operating modes:
 2. `baseline`: a TF-IDF + logistic regression baseline if the BERT checkpoint is missing
 3. `heuristic`: regex and keyword rules if no trained artifacts are present
 
+By default, the app now prefers the TF-IDF baseline over regex-only fallback, and baseline thresholds are slightly relaxed so borderline real-world detections can still surface for the second-stage review to inspect.
+
 Techniques used:
 
 - multi-label clause classification over the CUAD clause set
@@ -71,13 +73,14 @@ After clauses are detected, the app adds:
 
 - a clause category such as `Financial & Liability` or `IP & Licensing`
 - a risk level such as `HIGH`, `MEDIUM`, or `LOW`
+- a short `why this risk` explanation and a `watch out for` note for the clause detail view
 
 When multiple clause labels point to the same supporting passage, the UI groups them together so the user does not see a stack of duplicate evidence cards.
 
 Techniques used:
 
 - rule-based mapping from clause name to category
-- rule-based mapping from clause name to risk level
+- a hybrid risk tagger: snippet-level rules first, with an LLM fallback only for ambiguous or higher-priority clauses
 - evidence-key grouping so clauses with the same supporting snippet are merged in the UI
 
 Why this matters:
@@ -333,6 +336,7 @@ The current app is organized roughly like this:
 - [`rag_index.py`](/Users/saiashwin/BT5153/rag_index.py): CUAD-based RAG index build and cache logic
 - [`document_rag.py`](/Users/saiashwin/BT5153/document_rag.py): per-document chunking and retrieval for chatbot answers
 - [`contract_chat.py`](/Users/saiashwin/BT5153/contract_chat.py): chatbot logic, guardrails, suggested questions, and answer generation
+- [`risk_tagger.py`](/Users/saiashwin/BT5153/risk_tagger.py): contextual clause risk tagging with rule-first logic and optional LLM fallback
 - [`llm_summary.py`](/Users/saiashwin/BT5153/llm_summary.py): contract summary generation
 - [`openai_utils.py`](/Users/saiashwin/BT5153/openai_utils.py): shared OpenAI configuration helpers
 - [`static/index.html`](/Users/saiashwin/BT5153/static/index.html): dashboard UI
@@ -453,12 +457,17 @@ Some useful runtime knobs:
 
 - `LEXSCAN_ENABLE_SECOND_STAGE_REVIEW`
 - `LEXSCAN_ENABLE_CHATBOT`
+- `LEXSCAN_BASELINE_THRESHOLD_FLOOR`
+- `LEXSCAN_BASELINE_THRESHOLD_CEILING`
 - `LEXSCAN_CHAT_MODEL`
 - `LEXSCAN_CHAT_TOP_K`
 - `LEXSCAN_CHAT_CHUNK_CHARS`
 - `LEXSCAN_CHAT_CHUNK_OVERLAP`
 - `LEXSCAN_CHAT_HISTORY_TURNS`
 - `LEXSCAN_CHAT_MIN_SCORE`
+- `LEXSCAN_RISK_TAGGER_LLM_MODEL`
+- `LEXSCAN_ENABLE_RISK_LLM_FALLBACK`
+- `LEXSCAN_RISK_TAGGER_MAX_LLM_CALLS`
 - `LEXSCAN_RAG_EMBEDDING_BACKEND`
 - `LEXSCAN_RAG_EMBEDDING_MODEL`
 - `LEXSCAN_DOC_CACHE_MAX`

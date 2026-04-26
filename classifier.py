@@ -94,8 +94,8 @@ def _get_category(clause: str) -> str:
 
 
 def _classifier_mode_preference() -> str:
-    value = os.getenv("LEXSCAN_CLASSIFIER_MODE", "auto").strip().lower()
-    return value if value in {"auto", "model", "baseline", "heuristic"} else "auto"
+    value = os.getenv("LEXSCAN_CLASSIFIER_MODE", "baseline").strip().lower()
+    return value if value in {"auto", "model", "baseline", "heuristic"} else "baseline"
 
 
 def _resolve_torch_device(torch):
@@ -703,11 +703,23 @@ class LegalClauseClassifier:
             )
 
         # Stay in heuristic mode — regex fallback handles classification.
-        logger.warning(
-            "No model artifacts found at %s or %s — running in heuristic (regex) mode.",
-            checkpoint_path,
-            baseline_path,
-        )
+        if self._mode_preference != "heuristic":
+            self.reliability_status = "critical"
+            self.reliability_warning = (
+                "Model artifacts are missing — falling back to keyword regex. "
+                "Detection quality will be significantly degraded."
+            )
+            logger.error(
+                "No model artifacts found at %s or %s — running in heuristic (regex) mode.",
+                checkpoint_path,
+                baseline_path,
+            )
+        else:
+            logger.warning(
+                "No model artifacts found at %s or %s — running in heuristic (regex) mode.",
+                checkpoint_path,
+                baseline_path,
+            )
 
     def _load_tfidf_baseline(self, path: str) -> None:
         try:
@@ -728,6 +740,17 @@ class LegalClauseClassifier:
             else:
                 self.thresholds = {clause: best_threshold for clause in self.id_to_clause.values()}
                 self.threshold_source = "artifact_global"
+            self.original_thresholds = dict(self.thresholds)
+            floor = float(os.getenv("LEXSCAN_BASELINE_THRESHOLD_FLOOR", "0.35"))
+            ceiling = float(os.getenv("LEXSCAN_BASELINE_THRESHOLD_CEILING", "0.55"))
+            if floor > ceiling:
+                floor, ceiling = ceiling, floor
+            self.thresholds = {
+                name: max(min(float(t), ceiling), floor)
+                for name, t in self.thresholds.items()
+            }
+            self.threshold_floor = floor
+            self.threshold_ceiling = ceiling
             self.calibration_temperature = float(payload.get("calibration_temperature", 1.0))
             self.reliability_status = "ready"
             self.reliability_warning = ""
@@ -769,12 +792,15 @@ class LegalClauseClassifier:
 
         probs = self._score_baseline_probs(text)
         results: list[dict] = []
+        original_thresholds = getattr(self, "original_thresholds", None) or self.thresholds
 
         for label_id, clause_name in self.id_to_clause.items():
             prob = float(probs[label_id])
             threshold = float(self.thresholds.get(clause_name, 0.5))
             if prob < threshold:
                 continue
+            original = float(original_thresholds.get(clause_name, threshold))
+            low_confidence = prob < original
 
             results.append({
                 "clause": clause_name,
@@ -784,6 +810,7 @@ class LegalClauseClassifier:
                 "snippet": _find_snippet(text, clause_name) or _find_snippet_by_terms(text, clause_name),
                 "detected": True,
                 "confidence_source": "calibrated_baseline",
+                "low_confidence": low_confidence,
             })
 
         results.sort(key=lambda x: x["confidence"], reverse=True)

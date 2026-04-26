@@ -37,7 +37,8 @@ def test_load_tfidf_baseline_prefers_saved_per_clause_thresholds(monkeypatch):
     clf._load_tfidf_baseline("dummy.joblib")
 
     assert clf.mode == "baseline"
-    assert clf.thresholds == {"A": pytest.approx(0.8), "B": pytest.approx(0.3)}
+    assert clf.original_thresholds == {"A": pytest.approx(0.8), "B": pytest.approx(0.3)}
+    assert clf.thresholds == {"A": pytest.approx(0.55), "B": pytest.approx(0.35)}
     assert clf.threshold_source == "artifact_per_clause"
     assert clf.calibration_temperature == pytest.approx(1.7)
     assert clf.reliability_status == "ready"
@@ -66,3 +67,9 @@ def test_classify_reports_degraded_mode():
     assert result["degraded_mode"] is True
     assert result["reliability"]["status"] == "degraded"
     assert result["risk_summary"] == {"HIGH": 1, "MEDIUM": 0, "LOW": 0}
+
+
+def test_classifier_mode_preference_defaults_to_baseline(monkeypatch):
+    monkeypatch.delenv("LEXSCAN_CLASSIFIER_MODE", raising=False)
+
+    assert classifier._classifier_mode_preference() == "baseline"

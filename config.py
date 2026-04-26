@@ -155,6 +155,11 @@ class ReviewConfig:
     chat_history_turns: int = field(default_factory=lambda: int(os.getenv("LEXSCAN_CHAT_HISTORY_TURNS", "6")))
     chat_min_score: float = field(default_factory=lambda: float(os.getenv("LEXSCAN_CHAT_MIN_SCORE", "0.12")))
     max_rag_cache_mb: int = field(default_factory=lambda: int(os.getenv("LEXSCAN_MAX_RAG_CACHE_MB", "768")))
+    risk_tagger_llm_model: str = field(default_factory=lambda: model_from_env("LEXSCAN_RISK_TAGGER_LLM_MODEL", "gpt-4o-mini"))
+    enable_risk_llm_fallback: bool = field(default_factory=lambda: _env_flag("LEXSCAN_ENABLE_RISK_LLM_FALLBACK", True))
+    risk_tagger_llm_budget: int = field(default_factory=lambda: int(os.getenv("LEXSCAN_RISK_TAGGER_MAX_LLM_CALLS", "10")))
+    baseline_threshold_floor: float = field(default_factory=lambda: float(os.getenv("LEXSCAN_BASELINE_THRESHOLD_FLOOR", "0.35")))
+    baseline_threshold_ceiling: float = field(default_factory=lambda: float(os.getenv("LEXSCAN_BASELINE_THRESHOLD_CEILING", "0.55")))
 
 
 def get_review_config() -> ReviewConfig:

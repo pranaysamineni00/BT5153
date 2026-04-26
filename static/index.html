@@ -1911,6 +1911,34 @@
       align-items: flex-start;
     }
 
+    .risk-source-pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(13, 30, 56, .08);
+      background: var(--surface-soft);
+      color: var(--ink-2);
+      font-family: 'IBM Plex Mono', monospace;
+      font-size: 11.5px;
+    }
+
+    .risk-source-pill.rule {
+      background: rgba(255,255,255,.9);
+      color: var(--ink-2);
+    }
+
+    .risk-source-pill.llm {
+      background: rgba(37, 99, 235, .1);
+      color: var(--navy-2);
+      border-color: rgba(37, 99, 235, .18);
+    }
+
+    .risk-source-pill.static {
+      background: rgba(13, 30, 56, .04);
+      color: var(--ink-3);
+    }
+
     .confidence-pill {
       display: inline-flex;
       align-items: center;
@@ -1933,6 +1961,16 @@
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 12px;
+    }
+
+    .detail-risk-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .detail-risk-note {
+      min-height: 100%;
     }
 
     .metric-card {
@@ -2776,6 +2814,7 @@
               </div>
               <div class="detail-header-side">
                 <span class="risk-badge LOW" id="detail-risk">Low</span>
+                <span class="risk-source-pill static" id="detail-risk-source">Default</span>
                 <span class="confidence-pill" id="detail-confidence">Second-stage review <strong>Waiting</strong></span>
               </div>
             </div>
@@ -2792,6 +2831,20 @@
               <div class="metric-card">
                 <div class="metric-label">Final Decision</div>
                 <div class="metric-value" id="detail-decision-explainer">-</div>
+              </div>
+            </div>
+
+            <div class="detail-section">
+              <div class="detail-section-label">Risk Context</div>
+              <div class="detail-risk-grid">
+                <div class="metric-card detail-risk-note">
+                  <div class="metric-label">Why this risk</div>
+                  <div class="detail-section-copy" id="detail-risk-reason">Risk reasoning appears here.</div>
+                </div>
+                <div class="metric-card detail-risk-note">
+                  <div class="metric-label">Watch out for</div>
+                  <div class="detail-section-copy" id="detail-watch-out-for">Practical watch-outs appear here.</div>
+                </div>
               </div>
             </div>
 
@@ -2951,6 +3004,7 @@
     const detailName = document.getElementById('detail-name');
     const detailSummary = document.getElementById('detail-summary');
     const detailRisk = document.getElementById('detail-risk');
+    const detailRiskSource = document.getElementById('detail-risk-source');
     const detailConfidence = document.getElementById('detail-confidence');
     const detailModelConfidence = document.getElementById('detail-model-confidence');
     const detailDecisionTitle = document.getElementById('detail-decision-title');
@@ -2969,6 +3023,8 @@
     const detailCandidateSummary = document.getElementById('detail-candidate-summary');
     const detailCandidateLabels = document.getElementById('detail-candidate-labels');
     const detailReviewReason = document.getElementById('detail-review-reason');
+    const detailRiskReason = document.getElementById('detail-risk-reason');
+    const detailWatchOutFor = document.getElementById('detail-watch-out-for');
     const detailGuidance = document.getElementById('detail-guidance');
     const detailEvidence = document.getElementById('detail-evidence');
     const detailPositiveDetails = document.getElementById('detail-positive-details');
@@ -3100,6 +3156,12 @@
       if (status === 'disabled') return { label: 'Chat disabled', tone: 'disabled' };
       if (status === 'error') return { label: 'Chat unavailable', tone: 'error' };
       return { label: 'Waiting for analysis', tone: 'idle' };
+    }
+
+    function formatRiskSource(source) {
+      if (source === 'rule') return { label: 'Rule', tone: 'rule' };
+      if (source === 'llm') return { label: 'AI', tone: 'llm' };
+      return { label: 'Default', tone: 'static' };
     }
 
     function formatDecisionLabel(decision) {
@@ -3552,6 +3614,9 @@
             reviewEvidenceCount: positiveExamples.length + hardNegativeExamples.length,
             reviewHasRag: positiveExamples.length + hardNegativeExamples.length > 0,
             reviewLabelChanged: reviewDecision === 'RERANK_LABEL' && reviewFinalLabel && reviewFinalLabel !== clause.clause,
+            riskReason: clause.risk_reason || '',
+            watchOutFor: clause.watch_out_for || '',
+            riskSource: clause.risk_source || 'static',
           };
         })
         .sort((a, b) => {
@@ -3730,6 +3795,9 @@
       detailSummary.textContent = selected.explanation;
       detailRisk.className = `risk-badge ${selected.risk}`;
       detailRisk.textContent = selected.risk;
+      const riskSource = formatRiskSource(selected.riskSource);
+      detailRiskSource.className = `risk-source-pill ${riskSource.tone}`;
+      detailRiskSource.textContent = riskSource.label;
       detailConfidence.innerHTML = `Second-stage review <strong>${escHtml(formatReviewStatusLabel(selected.reviewStatus))}</strong>`;
       detailModelConfidence.innerHTML = `Model confidence <strong>${pct}%</strong>`;
       detailDecisionTitle.textContent = selected.reviewDecisionLabel;
@@ -3750,6 +3818,8 @@
         : 'No alternate labels';
       detailCandidateLabels.innerHTML = renderCandidateChips(selected.reviewCandidateLabels);
       detailReviewReason.textContent = selected.reviewReason;
+      detailRiskReason.textContent = selected.riskReason || 'No contextual risk reasoning was generated for this clause.';
+      detailWatchOutFor.textContent = selected.watchOutFor || 'No specific watch-out was generated for this clause.';
       detailGuidance.textContent = selected.explanation;
       detailEvidence.textContent = hasEvidence
         ? selected.snippet

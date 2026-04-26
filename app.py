@@ -30,6 +30,7 @@ from config import get_review_config
 from document_rag import build_document_index
 from llm_summary import build_contract_summary, is_summary_enabled
 from openai_utils import get_openai_client, has_openai_package, openai_api_key
+from risk_tagger import enrich_clause_risks, recompute_risk_summary
 from review_pipeline import review_contract_predictions
 
 _LOG_PATH = Path(__file__).with_name("dashboard_server.log")
@@ -108,13 +109,16 @@ def _status_mode() -> str:
     if _classifier is not None:
         return _classifier.mode
 
-    preference = os.getenv("LEXSCAN_CLASSIFIER_MODE", "auto").strip().lower()
-    if preference == "heuristic":
-        return "heuristic"
-
+    preference = os.getenv("LEXSCAN_CLASSIFIER_MODE", "baseline").strip().lower()
     base_dir = Path(__file__).parent
     checkpoint_path = base_dir / "models" / "Legal-BERT_(CUAD).pt"
     baseline_path = base_dir / "checkpoints" / "tfidf_lr_artifacts.joblib"
+    if preference == "heuristic":
+        return "heuristic"
+    if preference == "baseline":
+        return "baseline" if baseline_path.exists() else "heuristic"
+    if preference == "model":
+        return "model" if checkpoint_path.exists() else "heuristic"
     if checkpoint_path.exists():
         return "model"
     if baseline_path.exists():
@@ -258,6 +262,15 @@ def classify():
             "message": "Second-stage review failed during this request.",
         }
     _log_memory_snapshot("After second-stage review")
+    try:
+        result["clauses"] = enrich_clause_risks(
+            list(result.get("clauses", [])),
+            review_items=result["second_stage_review"].get("items", []),
+            config=review_config,
+        )
+        result["risk_summary"] = recompute_risk_summary(result["clauses"])
+    except Exception:
+        logger.exception("Risk enrichment error")
     result["llm_summary"] = build_contract_summary(text)
     logger.info(
         "AI summary status | available=%s | status=%s",
