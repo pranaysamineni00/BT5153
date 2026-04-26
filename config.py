@@ -1,89 +1,44 @@
 """Shared configuration for the RAG-based second-stage review layer."""
 from __future__ import annotations
 
-import importlib.util
 import os
 from dataclasses import dataclass, field
 from functools import lru_cache
-from pathlib import Path
-
-_ENV_PATH = Path(__file__).with_name(".env")
-_MODEL_NAME_RE = r"^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$"
-
-
-def _load_local_env() -> None:
-    """Best-effort .env loader for local development."""
-    if not _ENV_PATH.exists():
-        return
-
-    try:
-        raw = _ENV_PATH.read_text(encoding="utf-8")
-    except OSError:
-        return
-
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-
-        key, value = stripped.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
+from openai_utils import (
+    get_openai_client,
+    has_openai_package,
+    is_valid_model_name,
+    load_local_env,
+    model_from_env,
+    openai_api_key,
+)
 
 
 def _env_flag(name: str, default: bool) -> bool:
-    _load_local_env()
+    load_local_env()
     value = os.getenv(name)
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def has_openai_package() -> bool:
-    return importlib.util.find_spec("openai") is not None
-
-
-def openai_api_key() -> str:
-    _load_local_env()
-    return os.getenv("OPENAI_API_KEY", "").strip()
-
-
 def review_llm_available() -> bool:
     return bool(openai_api_key()) and has_openai_package()
 
 
-def _is_valid_model_name(model_name: str) -> bool:
-    cleaned = (model_name or "").strip()
-    if not cleaned or "=" in cleaned or any(ch.isspace() for ch in cleaned):
-        return False
-
-    import re
-
-    return bool(re.match(_MODEL_NAME_RE, cleaned))
-
-
 def review_model_name() -> str:
-    _load_local_env()
-    configured = os.getenv("OPENAI_REVIEW_MODEL", "").strip()
-    if _is_valid_model_name(configured):
-        return configured
-    return "gpt-4o-mini"
+    return model_from_env("OPENAI_REVIEW_MODEL", "gpt-4o-mini")
+
+
+def chat_model_name() -> str:
+    return model_from_env("LEXSCAN_CHAT_MODEL", "gpt-4o-mini")
 
 
 @lru_cache(maxsize=1)
 def review_client():
-    api_key = openai_api_key()
-    if not api_key:
+    if not openai_api_key():
         raise RuntimeError("OPENAI_API_KEY is not set.")
-
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError("openai>=1.30 is required for second-stage review.") from exc
-
-    return OpenAI(api_key=api_key, timeout=45.0)
+    return get_openai_client(timeout=45.0)
 
 
 CLAUSE_ALIAS_MAP: dict[str, tuple[str, ...]] = {
@@ -192,8 +147,16 @@ class ReviewConfig:
     model_top_k: int = field(default_factory=lambda: int(os.getenv("LEXSCAN_REVIEW_TOP_K_LABELS", "3")))
     example_snippet_chars: int = field(default_factory=lambda: int(os.getenv("LEXSCAN_RAG_SNIPPET_CHARS", "320")))
     enable_second_stage_review: bool = field(default_factory=lambda: _env_flag("LEXSCAN_ENABLE_SECOND_STAGE_REVIEW", True))
+    enable_chatbot: bool = field(default_factory=lambda: _env_flag("LEXSCAN_ENABLE_CHATBOT", True))
+    chat_model: str = field(default_factory=chat_model_name)
+    chat_top_k: int = field(default_factory=lambda: int(os.getenv("LEXSCAN_CHAT_TOP_K", "4")))
+    chat_chunk_chars: int = field(default_factory=lambda: int(os.getenv("LEXSCAN_CHAT_CHUNK_CHARS", "900")))
+    chat_chunk_overlap: int = field(default_factory=lambda: int(os.getenv("LEXSCAN_CHAT_CHUNK_OVERLAP", "160")))
+    chat_history_turns: int = field(default_factory=lambda: int(os.getenv("LEXSCAN_CHAT_HISTORY_TURNS", "6")))
+    chat_min_score: float = field(default_factory=lambda: float(os.getenv("LEXSCAN_CHAT_MIN_SCORE", "0.12")))
+    max_rag_cache_mb: int = field(default_factory=lambda: int(os.getenv("LEXSCAN_MAX_RAG_CACHE_MB", "768")))
 
 
 def get_review_config() -> ReviewConfig:
-    _load_local_env()
+    load_local_env()
     return ReviewConfig()

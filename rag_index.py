@@ -1,6 +1,7 @@
 """Build and cache a RAG knowledge base from the CUAD training split only."""
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -22,6 +23,13 @@ try:
 except ImportError:  # pragma: no cover - joblib is in requirements, this keeps import-time resilient
     joblib = None
 
+try:
+    from scipy import sparse
+except ImportError:  # pragma: no cover
+    sparse = None
+
+
+logger = logging.getLogger(__name__)
 
 _RAG_INDEX_CACHE: "RagIndex | None" = None
 
@@ -44,7 +52,7 @@ class RagIndex:
     """In-memory RAG index plus metadata needed for retrieval."""
 
     entries: list[RagExample]
-    embeddings: np.ndarray
+    embeddings: Any
     label_definitions: dict[str, str]
     entry_ids_by_label: dict[str, list[int]]
     hard_negative_entry_ids_by_label: dict[str, list[int]]
@@ -89,8 +97,8 @@ class RagIndex:
         if self.tfidf_vectorizer is None:
             raise RuntimeError("TF-IDF fallback vectorizer is missing from the RAG index.")
 
-        encoded = self.tfidf_vectorizer.transform([text]).toarray().astype(np.float32)
-        return _normalize_rows(encoded)[0]
+        encoded = self.tfidf_vectorizer.transform([text]).astype(np.float32)
+        return _normalize_rows(encoded)
 
     def search_entries(
         self,
@@ -116,7 +124,7 @@ class RagIndex:
                 return [self.entries[idx] for idx in filtered[:top_k]]
 
         subset = self.embeddings[candidate_indices]
-        scores = subset @ query
+        scores = _score_matrix(subset, query)
         order = np.argsort(-scores)[:top_k]
         return [self.entries[candidate_indices[i]] for i in order]
 
@@ -141,6 +149,7 @@ class RagIndex:
             "embedding_model_name": self.embedding_model_name,
             "confusion_map": self.confusion_map,
             "tfidf_vectorizer": self.tfidf_vectorizer,
+            "cache_version": 2,
         }
         out_path = Path(path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -156,9 +165,15 @@ class RagIndex:
             return None
 
         payload = joblib.load(in_path)
+        raw_embeddings = payload["embeddings"]
+        if _is_sparse_matrix(raw_embeddings):
+            embeddings = raw_embeddings.astype(np.float32)
+        else:
+            embeddings = np.asarray(raw_embeddings, dtype=np.float32)
+
         index = cls(
             entries=[RagExample(**item) for item in payload["entries"]],
-            embeddings=np.asarray(payload["embeddings"], dtype=np.float32),
+            embeddings=embeddings,
             label_definitions=dict(payload["label_definitions"]),
             entry_ids_by_label={k: list(v) for k, v in payload["entry_ids_by_label"].items()},
             hard_negative_entry_ids_by_label={
@@ -178,9 +193,25 @@ class RagIndex:
 
 
 def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
+    if _is_sparse_matrix(matrix):
+        from sklearn.preprocessing import normalize
+
+        return normalize(matrix, norm="l2", axis=1, copy=False)
     norms = np.linalg.norm(matrix, axis=1, keepdims=True)
     norms = np.clip(norms, 1e-7, None)
     return matrix / norms
+
+
+def _is_sparse_matrix(matrix: Any) -> bool:
+    return sparse is not None and sparse.issparse(matrix)
+
+
+def _score_matrix(matrix: Any, query: Any) -> np.ndarray:
+    if _is_sparse_matrix(matrix):
+        product = matrix @ query.T
+        return np.asarray(product.toarray()).ravel()
+    dense_query = query[0] if isinstance(query, np.ndarray) and query.ndim == 2 else query
+    return np.asarray(matrix @ dense_query, dtype=np.float32).ravel()
 
 
 def _default_clause_definition(label: str) -> str:
@@ -254,7 +285,7 @@ def _encode_texts(
         from sklearn.feature_extraction.text import TfidfVectorizer
 
         vectorizer = TfidfVectorizer(max_features=40_000, ngram_range=(1, 2), sublinear_tf=True)
-        matrix = vectorizer.fit_transform(texts).toarray().astype(np.float32)
+        matrix = vectorizer.fit_transform(texts).astype(np.float32)
         return _normalize_rows(matrix), "tfidf", vectorizer
 
     try:
@@ -263,7 +294,7 @@ def _encode_texts(
         from sklearn.feature_extraction.text import TfidfVectorizer
 
         vectorizer = TfidfVectorizer(max_features=40_000, ngram_range=(1, 2), sublinear_tf=True)
-        matrix = vectorizer.fit_transform(texts).toarray().astype(np.float32)
+        matrix = vectorizer.fit_transform(texts).astype(np.float32)
         return _normalize_rows(matrix), "tfidf", vectorizer
 
     encoder = SentenceTransformer(config.rag_embedding_model)
@@ -282,6 +313,8 @@ def _build_label_neighbor_map(
     texts = [f"Label: {label}\nDefinition: {definitions[label]}" for label in labels]
     embeddings, _, _ = _encode_texts(texts, config)
     similarity = embeddings @ embeddings.T
+    if _is_sparse_matrix(similarity):
+        similarity = similarity.toarray()
 
     neighbors: dict[str, list[str]] = {}
     for idx, label in enumerate(labels):
@@ -333,18 +366,31 @@ def build_rag_index(
             return _RAG_INDEX_CACHE
 
     if not force_rebuild and cuad_df is None:
-        cached = RagIndex.load(config.rag_index_cache_path)
-        if cached is not None:
-            backend_matches = cached.embedding_backend == config.rag_embedding_backend
-            model_matches = (
-                cached.embedding_backend != "sentence-transformers"
-                or cached.embedding_model_name == config.rag_embedding_model
-            )
-            if backend_matches and model_matches:
-                if confusion_map:
-                    cached.confusion_map = {k: list(v) for k, v in confusion_map.items()}
-                _RAG_INDEX_CACHE = cached
-                return cached
+        cache_path = Path(config.rag_index_cache_path)
+        skip_cache_load = False
+        if cache_path.exists() and config.rag_embedding_backend == "tfidf" and config.max_rag_cache_mb > 0:
+            size_mb = cache_path.stat().st_size / (1024 * 1024)
+            if size_mb > config.max_rag_cache_mb:
+                logger.warning(
+                    "Ignoring oversized TF-IDF RAG cache at %s (%.0f MB); rebuilding with sparse storage.",
+                    cache_path,
+                    size_mb,
+                )
+                skip_cache_load = True
+
+        if not skip_cache_load:
+            cached = RagIndex.load(config.rag_index_cache_path)
+            if cached is not None:
+                backend_matches = cached.embedding_backend == config.rag_embedding_backend
+                model_matches = (
+                    cached.embedding_backend != "sentence-transformers"
+                    or cached.embedding_model_name == config.rag_embedding_model
+                )
+                if backend_matches and model_matches:
+                    if confusion_map:
+                        cached.confusion_map = {k: list(v) for k, v in confusion_map.items()}
+                    _RAG_INDEX_CACHE = cached
+                    return cached
 
     if cuad_df is None:
         cuad_df = load_cuad(config.data_dir)
@@ -394,16 +440,17 @@ def build_rag_index(
     for idx, item in enumerate(examples):
         entry_ids_by_label.setdefault(item.clause_label, []).append(idx)
 
-    vector_store_type = "numpy"
+    vector_store_type = "sparse" if _is_sparse_matrix(embeddings) else "numpy"
     faiss_index = None
-    try:
-        import faiss
+    if not _is_sparse_matrix(embeddings):
+        try:
+            import faiss
 
-        faiss_index = faiss.IndexFlatIP(embeddings.shape[1])
-        faiss_index.add(embeddings.astype(np.float32))
-        vector_store_type = "faiss"
-    except ImportError:
-        faiss_index = None
+            faiss_index = faiss.IndexFlatIP(embeddings.shape[1])
+            faiss_index.add(embeddings.astype(np.float32))
+            vector_store_type = "faiss"
+        except ImportError:
+            faiss_index = None
 
     rag_index = RagIndex(
         entries=examples,

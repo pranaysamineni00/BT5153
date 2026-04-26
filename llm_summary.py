@@ -1,51 +1,35 @@
 """OpenAI-backed contract summary helpers for the LexScan Flask app."""
 from __future__ import annotations
 
-import importlib.util
 import logging
-import os
 import re
-from functools import lru_cache
-from pathlib import Path
+
+from openai_utils import (
+    get_openai_client,
+    has_openai_package,
+    is_valid_model_name,
+    openai_api_key,
+)
 
 logger = logging.getLogger(__name__)
 
 _MAX_CHARS_TYPE = 3_000
 _MAX_CHARS_SUMMARY = 6_000
 _SUMMARY_BULLET_RE = re.compile(r"^\s*(?:[-*]|\d+[\.\)])\s*")
-_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$")
-_ENV_PATH = Path(__file__).with_name(".env")
-
-
-def _load_local_env() -> None:
-    """Best-effort parse of a local .env file for development convenience."""
-    if not _ENV_PATH.exists():
-        return
-
-    try:
-        raw = _ENV_PATH.read_text(encoding="utf-8")
-    except OSError:
-        return
-
-    for line in raw.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-
-        key, value = stripped.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-
-        if key and key not in os.environ:
-            os.environ[key] = value
 
 
 def _summary_model() -> str:
-    _load_local_env()
-    configured = os.getenv("OPENAI_CONTRACT_SUMMARY_MODEL", "").strip()
-    if _is_valid_model_name(configured):
-        return configured
-    return "gpt-4o"
+    from openai_utils import model_from_env
+
+    return model_from_env("OPENAI_CONTRACT_SUMMARY_MODEL", "gpt-4o")
+
+
+def _has_openai_package() -> bool:
+    return has_openai_package()
+
+
+def _is_valid_model_name(model_name: str) -> bool:
+    return is_valid_model_name(model_name)
 
 
 def _summary_model_candidates() -> list[str]:
@@ -65,25 +49,8 @@ def _summary_model_candidates() -> list[str]:
         output.append(cleaned)
     return output
 
-
-def _api_key() -> str:
-    _load_local_env()
-    return os.getenv("OPENAI_API_KEY", "").strip()
-
-
-def _has_openai_package() -> bool:
-    return importlib.util.find_spec("openai") is not None
-
-
 def is_summary_enabled() -> bool:
-    return bool(_api_key()) and _has_openai_package()
-
-
-def _is_valid_model_name(model_name: str) -> bool:
-    cleaned = (model_name or "").strip()
-    if not cleaned or "=" in cleaned or any(ch.isspace() for ch in cleaned):
-        return False
-    return bool(_MODEL_NAME_RE.match(cleaned))
+    return bool(openai_api_key()) and _has_openai_package()
 
 
 def summary_unavailable_payload(
@@ -99,22 +66,6 @@ def summary_unavailable_payload(
         "bullets": [],
         "model": "",
     }
-
-
-@lru_cache(maxsize=1)
-def _client():
-    api_key = _api_key()
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set.")
-
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError(
-            "OpenAI package is not installed. Add openai>=1.30 to enable summaries."
-        ) from exc
-
-    return OpenAI(api_key=api_key, timeout=30.0)
 
 
 def _is_invalid_model_error(exc: Exception) -> bool:
@@ -146,6 +97,10 @@ def _chat_completion_with_model_fallback(
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("No valid OpenAI summary model candidates are configured.")
+
+
+def _client():
+    return get_openai_client(timeout=30.0)
 
 
 def classify_document_type(text: str) -> tuple[str, str]:
@@ -285,7 +240,7 @@ def parse_direct_summary_output(summary: str) -> tuple[str, list[str]]:
 
 def build_contract_summary(text: str) -> dict:
     """Return a UI-friendly OpenAI summary payload without breaking classification."""
-    if not _api_key():
+    if not openai_api_key():
         return summary_unavailable_payload(
             "Set OPENAI_API_KEY to enable the AI contract summary."
         )

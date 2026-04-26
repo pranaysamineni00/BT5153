@@ -5,11 +5,16 @@ import logging
 import os
 import sys
 import tempfile
+import gc
 from collections import OrderedDict
 from pathlib import Path
 from uuid import uuid4
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
 from flask import Flask, Response, jsonify, request, send_from_directory
 from flask_cors import CORS
 
@@ -20,8 +25,11 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 from classifier import LegalClauseClassifier
+from contract_chat import ContractChatbot, chatbot_available, suggested_queries_for_contract
 from config import get_review_config
+from document_rag import build_document_index
 from llm_summary import build_contract_summary, is_summary_enabled
+from openai_utils import get_openai_client, has_openai_package, openai_api_key
 from review_pipeline import review_contract_predictions
 
 _LOG_PATH = Path(__file__).with_name("dashboard_server.log")
@@ -47,15 +55,19 @@ _classifier: LegalClauseClassifier | None = None
 # In-memory cache of extracted document text keyed by a generated id. Used by
 # the lazy /api/excerpt endpoint so the client doesn't have to re-POST the
 # entire document on every card expansion. Bounded LRU — oldest evicted first.
-_DOC_CACHE_MAX = 32
+_DOC_CACHE_MAX = int(os.getenv("LEXSCAN_DOC_CACHE_MAX", "6"))
 _document_cache: "OrderedDict[str, str]" = OrderedDict()
+_chat_state_cache: "OrderedDict[str, dict]" = OrderedDict()
 
 
-def _cache_document(text: str) -> str:
+def _cache_document(text: str, chat_state: dict | None = None) -> str:
     doc_id = uuid4().hex
     _document_cache[doc_id] = text
+    if chat_state is not None:
+        _chat_state_cache[doc_id] = chat_state
     while len(_document_cache) > _DOC_CACHE_MAX:
-        _document_cache.popitem(last=False)
+        stale_doc_id, _ = _document_cache.popitem(last=False)
+        _chat_state_cache.pop(stale_doc_id, None)
     return doc_id
 
 
@@ -63,6 +75,13 @@ def _lookup_document(doc_id: str) -> str | None:
     if doc_id in _document_cache:
         _document_cache.move_to_end(doc_id)
         return _document_cache[doc_id]
+    return None
+
+
+def _lookup_chat_state(doc_id: str) -> dict | None:
+    if doc_id in _chat_state_cache:
+        _chat_state_cache.move_to_end(doc_id)
+        return _chat_state_cache[doc_id]
     return None
 
 
@@ -83,6 +102,24 @@ def _log_memory_snapshot(context: str) -> None:
     if rss is None:
         return
     logger.info("%s | rss=%.1f MB", context, rss)
+
+
+def _status_mode() -> str:
+    if _classifier is not None:
+        return _classifier.mode
+
+    preference = os.getenv("LEXSCAN_CLASSIFIER_MODE", "auto").strip().lower()
+    if preference == "heuristic":
+        return "heuristic"
+
+    base_dir = Path(__file__).parent
+    checkpoint_path = base_dir / "models" / "Legal-BERT_(CUAD).pt"
+    baseline_path = base_dir / "checkpoints" / "tfidf_lr_artifacts.joblib"
+    if checkpoint_path.exists():
+        return "model"
+    if baseline_path.exists():
+        return "baseline"
+    return "heuristic"
 
 
 def get_classifier() -> LegalClauseClassifier:
@@ -137,13 +174,13 @@ def index():
 
 @app.route("/api/status")
 def status():
-    clf = get_classifier()
     review_config = get_review_config()
     return jsonify({
-        "mode": clf.mode,
+        "mode": _status_mode(),
         "status": "ready",
         "llm_summary_enabled": is_summary_enabled(),
         "second_stage_review_enabled": review_config.enable_second_stage_review,
+        "chatbot_enabled": chatbot_available(review_config),
     })
 
 
@@ -191,18 +228,21 @@ def classify():
     )
     _log_memory_snapshot("After extraction")
 
+    clf = get_classifier()
     try:
-        result = get_classifier().classify(text)
+        result = clf.classify(text)
     except Exception as exc:
         logger.exception("Classification error")
         return jsonify({"error": f"Classification failed: {exc}"}), 500
 
     _log_memory_snapshot("After clause classification")
+    review_config = get_review_config()
     try:
         result["second_stage_review"] = review_contract_predictions(
             text,
-            get_classifier(),
+            clf,
             classification_result=result,
+            config=review_config,
         )
     except Exception:
         logger.exception("Second-stage review error")
@@ -215,8 +255,8 @@ def classify():
                 "RERANK_LABEL": 0,
                 "HUMAN_REVIEW": 0,
             },
+            "message": "Second-stage review failed during this request.",
         }
-
     _log_memory_snapshot("After second-stage review")
     result["llm_summary"] = build_contract_summary(text)
     logger.info(
@@ -227,7 +267,24 @@ def classify():
     _log_memory_snapshot("After AI summary")
     result["word_count"] = len(text.split())
     result["char_count"] = len(text)
-    result["document_id"] = _cache_document(text)
+    chat_state = {
+        "history": [],
+        "classification_result": {"clauses": list(result.get("clauses", []))},
+        "summary": result["llm_summary"],
+        "suggested_queries": suggested_queries_for_contract(result, result["llm_summary"]),
+        "history_limit": review_config.chat_history_turns,
+        "status": "ready" if chatbot_available(review_config) else "disabled",
+        "chat_error": "",
+        "document_index": None,
+    }
+
+    result["document_id"] = _cache_document(text, chat_state=chat_state)
+    result["chatbot"] = {
+        "status": chat_state["status"],
+        "suggested_queries": chat_state["suggested_queries"],
+        "history_limit": chat_state["history_limit"],
+    }
+    gc.collect()
     return jsonify(result)
 
 @app.route("/api/excerpt", methods=["POST"])
@@ -261,15 +318,12 @@ def explain():
     if not excerpt:
         return jsonify({"error": "Missing 'excerpt' in request body."}), 400
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
+    if not openai_api_key():
         return jsonify({
             "error": "OpenAI API key not configured. Add OPENAI_API_KEY to the .env file."
         }), 500
 
-    try:
-        from openai import OpenAI
-    except ImportError:
+    if not has_openai_package():
         return jsonify({"error": "openai package not installed: pip install openai"}), 500
 
     excerpt_for_prompt = excerpt[:4000]
@@ -283,8 +337,7 @@ def explain():
     )
 
     try:
-        client = OpenAI(api_key=api_key)
-        response = client.chat.completions.create(
+        response = get_openai_client(timeout=30.0).chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a legal-tech assistant who explains contract clauses in plain English for non-lawyers."},
@@ -299,6 +352,74 @@ def explain():
         return jsonify({"error": f"LLM call failed: {exc}"}), 500
 
     return jsonify({"explanation": explanation})
+
+
+@app.route("/api/chat/session", methods=["POST"])
+def chat_session():
+    payload = request.get_json(silent=True) or {}
+    doc_id = (payload.get("document_id") or "").strip()
+    if not doc_id:
+        return jsonify({"error": "Missing 'document_id'."}), 400
+
+    state = _lookup_chat_state(doc_id)
+    if state is None:
+        return jsonify({"error": "Document not in cache — please re-upload."}), 404
+
+    return jsonify({
+        "status": state.get("status", "error"),
+        "suggested_queries": state.get("suggested_queries", []),
+        "history_limit": state.get("history_limit", 0),
+    })
+
+
+@app.route("/api/chat", methods=["POST"])
+def chat():
+    payload = request.get_json(silent=True) or {}
+    doc_id = (payload.get("document_id") or "").strip()
+    message = (payload.get("message") or "").strip()
+    if not doc_id or not message:
+        return jsonify({"error": "Missing 'document_id' or 'message'."}), 400
+
+    state = _lookup_chat_state(doc_id)
+    if state is None:
+        return jsonify({"error": "Document not in cache — please re-upload."}), 404
+
+    document_index = state.get("document_index")
+    if document_index is None:
+        text = _lookup_document(doc_id)
+        if text is None:
+            return jsonify({"error": "Document not in cache — please re-upload."}), 404
+        try:
+            document_index = build_document_index(text, config=get_review_config())
+            state["document_index"] = document_index
+            _log_memory_snapshot("After chat document index build")
+        except Exception:
+            logger.exception("Document chat index build failed")
+            state["status"] = "error"
+            return jsonify({
+                "status": "error",
+                "answer": "The uploaded contract could not be prepared for chat.",
+                "citations": [],
+                "retrieved_examples": [],
+                "suggested_queries": state.get("suggested_queries", []),
+                "model": "",
+                "history_used": 0,
+            }), 200
+
+    bot = ContractChatbot(document_index, config=get_review_config())
+    history = list(state.get("history", []))
+    response_payload = bot.answer(
+        message=message,
+        history=history,
+        classification_result=state.get("classification_result"),
+        summary=state.get("summary"),
+    )
+
+    history.append({"role": "user", "content": message})
+    history.append({"role": "assistant", "content": response_payload.get("answer", "")})
+    state["history"] = history[-(get_review_config().chat_history_turns * 2) :]
+    gc.collect()
+    return jsonify(response_payload)
 
 
 def serve_app() -> None:
